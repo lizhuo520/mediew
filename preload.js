@@ -11,7 +11,7 @@ function subscribe(channel, callback) {
 
 contextBridge.exposeInMainWorld('api', {
   selectDirectory: () => ipcRenderer.invoke('select-directory'),
-  readDirectory: (dirPath, sortMode, sortDir) => ipcRenderer.invoke('read-directory', dirPath, sortMode, sortDir),
+  readDirectory: (dirPath, sortMode, sortDir, recursive) => ipcRenderer.invoke('read-directory', dirPath, sortMode, sortDir, Boolean(recursive)),
   cancelDirectoryScan: () => ipcRenderer.invoke('cancel-directory-scan'),
   onMediaMetadataUpdated: (callback) => subscribe('media-metadata-updated', callback),
   onMediaMetadataComplete: (callback) => subscribe('media-metadata-complete', callback),

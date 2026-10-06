@@ -15,7 +15,8 @@ const App = {
 
     SettingsManager.init(
       (mode) => this.onLayoutChange(mode),
-      () => this.onSortChange()
+      () => this.onSortChange(),
+      () => this.onRecursiveChange()
     );
 
     document.getElementById('directory-bar').addEventListener('click', () => {
@@ -91,6 +92,13 @@ const App = {
   },
 
   onSortChange() {
+    const path = this.currentPreviewPath || this.currentPath;
+    if (path) {
+      Waterfall.loadImages(path);
+    }
+  },
+
+  onRecursiveChange() {
     const path = this.currentPreviewPath || this.currentPath;
     if (path) {
       Waterfall.loadImages(path);

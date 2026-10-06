@@ -389,7 +389,8 @@ const Preview = {
   updateInfo(img) {
     const filenameEl = document.getElementById('info-filename');
     filenameEl.textContent = img.name;
-    filenameEl.title = img.name;
+    filenameEl.title = img.relativePath || img.name;
+    document.getElementById('info-folder').textContent = img.folder || '当前目录';
     document.getElementById('info-dimensions').textContent = img.width && img.height ? `${img.width} × ${img.height} px` : '加载中...';
     document.getElementById('info-filesize').textContent = this.formatSize(img.size);
     document.getElementById('info-date').textContent = img.date || '未知日期';

@@ -49,6 +49,7 @@
     </div>
     <button id="filter-favorites" class="toolbar-filter" title="仅显示收藏">★ 收藏</button>
     <button id="filter-raw" class="toolbar-filter" title="仅显示 RAW">RAW</button>
+    <button id="filter-recursive" class="toolbar-filter" title="包含所有子文件夹中的媒体">子文件夹</button>
     <span id="media-stats"></span>
   </div>
 
@@ -118,6 +119,10 @@
           <div class="info-row">
             <span class="info-label">文件名</span>
             <span class="info-value" id="info-filename">-</span>
+          </div>
+          <div class="info-row">
+            <span class="info-label">文件夹</span>
+            <span class="info-value" id="info-folder">-</span>
           </div>
           <div class="info-row">
             <span class="info-label">尺寸</span>
@@ -215,6 +220,16 @@
             <span>记住上次打开的目录</span>
             <label class="toggle-switch">
               <input type="checkbox" id="setting-remember-dir" checked>
+              <span class="toggle-slider"></span>
+            </label>
+          </div>
+        </div>
+        <div class="settings-section">
+          <div class="settings-label">浏览范围</div>
+          <div class="toggle-row">
+            <span>包含子文件夹中的图片</span>
+            <label class="toggle-switch">
+              <input type="checkbox" id="setting-recursive">
               <span class="toggle-slider"></span>
             </label>
           </div>

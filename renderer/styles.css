@@ -1449,3 +1449,23 @@ html.is-scrolling .image-card:hover {
 :root[data-theme="light"] .format-badge {
   color: #fff;
 }
+
+/* 递归浏览时显示相对子文件夹路径 */
+.path-badge {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  z-index: 4;
+  padding: 3px 7px;
+  border-radius: 6px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.58);
+  font-size: 10px;
+  line-height: 1.3;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}

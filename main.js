@@ -98,11 +98,12 @@ function sortMedia(items, sortMode, sortDir) {
 /**
  * 目录读取改为两阶段：立即返回基础文件信息，后台分批合并 EXIF。
  */
-ipcMain.handle('read-directory', async (event, dirPath, sortMode, sortDir) => {
+ipcMain.handle('read-directory', async (event, dirPath, sortMode, sortDir, recursive) => {
   if (!mediaService) return { scanId: null, items: [], pendingCount: 0 };
   const sender = event.sender;
   try {
     const result = await mediaService.startDirectoryScan(dirPath, {
+      recursive: Boolean(recursive),
       onBatch: (payload) => {
         if (!sender.isDestroyed()) sender.send('media-metadata-updated', payload);
       },

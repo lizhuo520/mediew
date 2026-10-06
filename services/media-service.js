@@ -22,6 +22,9 @@ const {
 
 // 限制 sharp 处理超大图片时的像素数，防止异常文件拖垮进程。
 const MAX_INPUT_PIXELS = 300000000;
+const SKIP_DIRECTORY_NAMES = new Set([
+  'node_modules', '.git', '.svn', '.hg', '$recycle.bin', 'system volume information'
+]);
 const THUMBNAIL_SIZES = [256, 384, 512, 768];
 const EXIF_PICK = [
   'DateTimeOriginal', 'DateTimeDigitized', 'CreateDate',
@@ -145,25 +148,24 @@ class MediaService {
    * 首屏只进行异步 readdir/stat，并使用缓存或文件时间立即返回；
    * 缺失的 EXIF 数据在后台分批补齐，因此不会让界面等待所有文件解析完成。
    */
-  async startDirectoryScan(dirPath, callbacks = {}) {
+  async startDirectoryScan(dirPath, options = {}) {
     this.cancelActiveScan();
     const scanId = `${Date.now()}-${++this.scanSequence}`;
-    const scan = { scanId, cancelled: false, callbacks };
+    const recursive = Boolean(options.recursive);
+    const scan = { scanId, cancelled: false, callbacks: options, recursive };
     this.activeScan = scan;
 
-    let entries = [];
+    let mediaEntries = [];
     try {
-      entries = await fsp.readdir(dirPath, { withFileTypes: true });
+      mediaEntries = await this.collectMediaEntries(dirPath, recursive, scan);
     } catch (error) {
-      if (typeof callbacks.onError === 'function') callbacks.onError(error);
-      return { scanId, items: [], pendingCount: 0 };
+      if (typeof options.onError === 'function') options.onError(error);
+      return { scanId, items: [], pendingCount: 0, recursive };
     }
 
-    const mediaEntries = entries.filter((entry) => entry.isFile() && getMediaInfo(entry.name).supported);
     const items = await mapWithConcurrency(mediaEntries, 16, async (entry) => {
-      const filePath = path.join(dirPath, entry.name);
-      const stat = await fsp.stat(filePath);
-      return this.createBaseItem(filePath, stat, getMediaInfo(entry.name));
+      const stat = await fsp.stat(entry.filePath);
+      return this.createBaseItem(entry.filePath, stat, getMediaInfo(entry.filePath), entry.relativePath);
     });
 
     items.sort((a, b) => a.mtime - b.mtime);
@@ -171,17 +173,60 @@ class MediaService {
 
     if (pending.length > 0) {
       this.enrichScan(scan, pending).catch((error) => {
-        if (!scan.cancelled && typeof callbacks.onError === 'function') callbacks.onError(error);
+        if (!scan.cancelled && typeof options.onError === 'function') options.onError(error);
       });
     } else {
       queueMicrotask(() => {
-        if (!scan.cancelled && typeof callbacks.onComplete === 'function') {
-          callbacks.onComplete({ scanId, total: 0, completed: 0 });
+        if (!scan.cancelled && typeof options.onComplete === 'function') {
+          options.onComplete({ scanId, total: 0, completed: 0 });
         }
       });
     }
 
-    return { scanId, items, pendingCount: pending.length };
+    return { scanId, items, pendingCount: pending.length, recursive };
+  }
+
+  /**
+   * 读取当前目录或递归读取全部子目录中的媒体条目。
+   * 每批并行读取 8 个目录，避免同步递归或一次性并发过高压垮主进程。
+   */
+  async collectMediaEntries(rootPath, recursive, scan) {
+    if (!recursive) {
+      const entries = await fsp.readdir(rootPath, { withFileTypes: true });
+      return entries
+        .filter((entry) => entry.isFile() && getMediaInfo(entry.name).supported)
+        .map((entry) => ({ filePath: path.join(rootPath, entry.name), relativePath: entry.name }));
+    }
+
+    const mediaEntries = [];
+    const directories = [rootPath];
+    let index = 0;
+    while (index < directories.length) {
+      if (scan.cancelled) break;
+      const batch = directories.slice(index, index + 8);
+      index += batch.length;
+      const results = await Promise.all(batch.map(async (directory) => {
+        try {
+          return { directory, entries: await fsp.readdir(directory, { withFileTypes: true }) };
+        } catch (_) {
+          // 无权限目录或扫描过程中被删除的目录直接跳过。
+          return { directory, entries: [] };
+        }
+      }));
+
+      results.forEach(({ directory, entries }) => {
+        entries.forEach((entry) => {
+          const fullPath = path.join(directory, entry.name);
+          if (entry.isFile() && getMediaInfo(entry.name).supported) {
+            mediaEntries.push({ filePath: fullPath, relativePath: path.relative(rootPath, fullPath) });
+          } else if (entry.isDirectory()) {
+            const lowerName = entry.name.toLowerCase();
+            if (!entry.name.startsWith('.') && !SKIP_DIRECTORY_NAMES.has(lowerName)) directories.push(fullPath);
+          }
+        });
+      });
+    }
+    return mediaEntries;
   }
 
   /**
@@ -193,7 +238,7 @@ class MediaService {
     this.activeScan = null;
   }
 
-  createBaseItem(filePath, stat, mediaInfo) {
+  createBaseItem(filePath, stat, mediaInfo, relativePath = path.basename(filePath)) {
     const signature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
     const cached = this.metadataCache.get(filePath, signature);
     const fallback = buildDateInfo(stat.mtimeMs, 'mtime');
@@ -201,6 +246,8 @@ class MediaService {
     return {
       name: path.basename(filePath),
       path: filePath,
+      relativePath,
+      folder: path.dirname(relativePath) === '.' ? '' : path.dirname(relativePath),
       size: stat.size,
       mtime: stat.mtimeMs,
       type: mediaInfo.type,

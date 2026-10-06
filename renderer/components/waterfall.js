@@ -79,6 +79,7 @@ const Waterfall = {
     this._searchInput = document.getElementById('media-search');
     this._favoriteFilter = document.getElementById('filter-favorites');
     this._rawFilter = document.getElementById('filter-raw');
+    this._recursiveFilter = document.getElementById('filter-recursive');
     this._statsElement = document.getElementById('media-stats');
 
     if (this._searchInput) {
@@ -100,6 +101,12 @@ const Waterfall = {
       this._rawFilter.addEventListener('click', () => {
         this._rawFilter.classList.toggle('active');
         this.applyFilters();
+      });
+    }
+
+    if (this._recursiveFilter) {
+      this._recursiveFilter.addEventListener('click', () => {
+        SettingsManager.setRecursiveMode(!SettingsManager.getRecursiveMode());
       });
     }
   },
@@ -352,7 +359,8 @@ const Waterfall = {
 
     const sortMode = SettingsManager.getSortMode();
     const sortDir = SettingsManager.getSortDir();
-    const result = await window.api.readDirectory(dirPath, sortMode, sortDir);
+    const recursive = SettingsManager.getRecursiveMode();
+    const result = await window.api.readDirectory(dirPath, sortMode, sortDir, recursive);
     if (generation !== this._generation) return;
 
     this._scanId = result.scanId || null;
@@ -648,7 +656,7 @@ const Waterfall = {
     const name = document.createElement('div');
     name.className = 'image-filename';
     name.textContent = imageInfo.name;
-    name.title = imageInfo.name;
+    name.title = imageInfo.relativePath || imageInfo.name;
     return name;
   },
 
@@ -689,6 +697,13 @@ const Waterfall = {
       badge.className = 'format-badge raw-badge';
       badge.textContent = `RAW · ${imageInfo.rawFormat}`;
       card.appendChild(badge);
+    }
+    if (imageInfo.folder) {
+      const pathBadge = document.createElement('span');
+      pathBadge.className = 'path-badge';
+      pathBadge.textContent = imageInfo.relativePath;
+      pathBadge.title = imageInfo.relativePath;
+      card.appendChild(pathBadge);
     }
     if (imageInfo.favorite) card.classList.add('favorite');
     const favorite = document.createElement('span');
@@ -772,6 +787,7 @@ const Waterfall = {
     else if (this._scanProgress) parts.push(`读取拍摄信息 ${this._scanProgress.completed}/${this._scanProgress.total}`);
     parts.push(`显示 ${shown} / ${total}`);
     if (rawCount) parts.push(`RAW ${rawCount}`);
+    if (typeof SettingsManager !== 'undefined' && SettingsManager.getRecursiveMode()) parts.push('递归');
     if (this.selectedPaths.size) parts.push(`已选 ${this.selectedPaths.size}`);
     this._statsElement.textContent = parts.join(' · ');
   },

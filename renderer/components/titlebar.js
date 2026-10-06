@@ -41,11 +41,13 @@ const SettingsManager = {
   modal: null,
   onLayoutChange: null,
   onSortChange: null,
+  onRecursiveChange: null,
 
-  init(onLayoutChange, onSortChange) {
+  init(onLayoutChange, onSortChange, onRecursiveChange) {
     this.modal = document.getElementById('settings-modal');
     this.onLayoutChange = onLayoutChange;
     this.onSortChange = onSortChange;
+    this.onRecursiveChange = onRecursiveChange;
 
     document.getElementById('btn-settings').addEventListener('click', () => {
       this.open();
@@ -90,6 +92,13 @@ const SettingsManager = {
       });
     }
 
+    const recursiveToggle = document.getElementById('setting-recursive');
+    if (recursiveToggle) {
+      recursiveToggle.addEventListener('change', () => {
+        this.setRecursiveMode(recursiveToggle.checked);
+      });
+    }
+
     document.addEventListener('keydown', (e) => {
       if (this.modal.classList.contains('active') && e.key === 'Escape') {
         this.close();
@@ -118,6 +127,9 @@ const SettingsManager = {
         const toggle = document.getElementById('setting-remember-dir');
         if (toggle) toggle.checked = saved.rememberDir;
       }
+      if (saved && saved.recursiveMode !== undefined) {
+        this.applyRecursiveMode(saved.recursiveMode);
+      }
     } catch (e) {}
   },
 
@@ -131,9 +143,9 @@ const SettingsManager = {
 
   getSettings() {
     try {
-      return JSON.parse(localStorage.getItem(this.STORAGE_KEY)) || { layoutMode: 'waterfall', sortMode: 'mtime', sortDir: 'desc', groupLevel: 'day', rememberDir: true };
+      return JSON.parse(localStorage.getItem(this.STORAGE_KEY)) || { layoutMode: 'waterfall', sortMode: 'mtime', sortDir: 'desc', groupLevel: 'day', rememberDir: true, recursiveMode: false };
     } catch (e) {
-      return { layoutMode: 'waterfall', sortMode: 'mtime', sortDir: 'desc', groupLevel: 'day', rememberDir: true };
+      return { layoutMode: 'waterfall', sortMode: 'mtime', sortDir: 'desc', groupLevel: 'day', rememberDir: true, recursiveMode: false };
     }
   },
 
@@ -175,6 +187,14 @@ const SettingsManager = {
     localStorage.setItem(this.STORAGE_KEY, JSON.stringify(settings));
   },
 
+  setRecursiveMode(enabled) {
+    const settings = this.getSettings();
+    settings.recursiveMode = Boolean(enabled);
+    localStorage.setItem(this.STORAGE_KEY, JSON.stringify(settings));
+    this.applyRecursiveMode(settings.recursiveMode);
+    if (this.onRecursiveChange) this.onRecursiveChange(settings.recursiveMode);
+  },
+
   applyLayout(mode) {
     document.querySelectorAll('.layout-option').forEach(btn => {
       btn.classList.toggle('active', btn.dataset.mode === mode);
@@ -207,11 +227,19 @@ const SettingsManager = {
     });
   },
 
+  applyRecursiveMode(enabled) {
+    const toggle = document.getElementById('setting-recursive');
+    if (toggle) toggle.checked = Boolean(enabled);
+    const toolbarToggle = document.getElementById('filter-recursive');
+    if (toolbarToggle) toolbarToggle.classList.toggle('active', Boolean(enabled));
+  },
+
   getLayoutMode() { return this.getSettings().layoutMode; },
   getSortMode() { return this.getSettings().sortMode; },
   getSortDir() { return this.getSettings().sortDir; },
   getGroupLevel() { return this.getSettings().groupLevel; },
   getRememberDir() { return this.getSettings().rememberDir; },
+  getRecursiveMode() { return Boolean(this.getSettings().recursiveMode); },
 
   saveLastDir(dirPath) { localStorage.setItem(this.LAST_DIR_KEY, dirPath); },
   getLastDir() { return localStorage.getItem(this.LAST_DIR_KEY); }

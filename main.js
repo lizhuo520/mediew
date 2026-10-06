@@ -1,42 +1,57 @@
-const { app, BrowserWindow, ipcMain, dialog, shell } = require('electron');
-const path = require('path');
-const fs = require('fs');
+'use strict';
 
-const _origStderrWrite = process.stderr.write.bind(process.stderr);
-process.stderr.write = (chunk, ...args) => {
-  const str = typeof chunk === 'string' ? chunk : chunk.toString();
-  if (str.includes('libpng warning') || str.includes('iCCP')) return true;
-  return _origStderrWrite(chunk, ...args);
-};
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  dialog,
+  shell,
+  clipboard
+} = require('electron');
+const path = require('node:path');
+const fs = require('node:fs');
+const fsp = fs.promises;
 
-const stateFile = path.join(__dirname, 'window-state.json');
-const imageExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp'];
-const videoExts = ['.mp4', '.webm', '.mov', '.avi', '.mkv', '.wmv'];
-const mediaExts = [...imageExts, ...videoExts];
+const { MediaService } = require('./services/media-service');
 
-let win;
+let win = null;
+let mediaService = null;
 let currentWatcher = null;
 let watchedPath = null;
 let debounceTimer = null;
+let isReadyToQuit = false;
 
+/**
+ * 窗口状态迁移到 userData 目录，避免安装目录不可写时保存失败。
+ */
+function getStateFile() {
+  return path.join(app.getPath('userData'), 'window-state.json');
+}
+
+/**
+ * 启动时只读取一次窗口状态，属于轻量同步操作，不会影响渲染性能。
+ */
 function loadWindowState() {
   try {
-    return JSON.parse(fs.readFileSync(stateFile, 'utf8'));
-  } catch (e) {
+    return JSON.parse(fs.readFileSync(getStateFile(), 'utf8'));
+  } catch (_) {
     return { width: 1200, height: 800, x: undefined, y: undefined };
   }
 }
 
+/**
+ * 关闭窗口时异步保存状态，不阻塞界面关闭流程。
+ */
 function saveWindowState() {
-  if (!win) return;
-  const bounds = win.getBounds();
-  const isMaximized = win.isMaximized();
-  fs.writeFileSync(stateFile, JSON.stringify({ ...bounds, isMaximized }));
+  if (!win || win.isDestroyed()) return;
+  const state = { ...win.getBounds(), isMaximized: win.isMaximized() };
+  fsp.mkdir(path.dirname(getStateFile()), { recursive: true })
+    .then(() => fsp.writeFile(getStateFile(), JSON.stringify(state), 'utf8'))
+    .catch(() => {});
 }
 
 function createWindow() {
   const state = loadWindowState();
-
   win = new BrowserWindow({
     width: state.width || 1200,
     height: state.height || 800,
@@ -50,21 +65,13 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
-      nodeIntegration: false
+      nodeIntegration: false,
+      backgroundThrottling: true
     }
   });
 
-  if (state.isMaximized) {
-    win.maximize();
-  }
-
+  if (state.isMaximized) win.maximize();
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
-
-  win.webContents.on('console-message', (e, level, message) => {
-    if (message.includes('libpng warning') || message.includes('iCCP')) {
-      e.preventDefault();
-    }
-  });
 
   win.on('close', () => {
     stopWatching();
@@ -72,45 +79,76 @@ function createWindow() {
   });
 }
 
-async function getImageDate(filePath) {
+/**
+ * 按当前设置对主进程返回的快照排序。
+ * EXIF 只在后台补充，因此排序始终基于可靠的 mtime 或文件名，不会因异步更新跳动。
+ */
+function sortMedia(items, sortMode, sortDir) {
+  const list = Array.isArray(items) ? items : [];
+  if (sortMode === 'filename') {
+    list.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
+    if (sortDir !== 'asc') list.reverse();
+  } else {
+    list.sort((a, b) => a.mtime - b.mtime);
+    if (sortDir !== 'asc') list.reverse();
+  }
+  return list;
+}
+
+/**
+ * 目录读取改为两阶段：立即返回基础文件信息，后台分批合并 EXIF。
+ */
+ipcMain.handle('read-directory', async (event, dirPath, sortMode, sortDir) => {
+  if (!mediaService) return { scanId: null, items: [], pendingCount: 0 };
+  const sender = event.sender;
   try {
-    const exifr = require('exifr');
-    const exif = await exifr.parse(filePath, true);
-
-    if (exif && exif.DateTimeOriginal) {
-      return buildDateInfo(exif.DateTimeOriginal);
-    }
-    if (exif && exif.DateTimeDigitized) {
-      return buildDateInfo(exif.DateTimeDigitized);
-    }
-  } catch (e) {
-    // EXIF parsing failed, fall through to mtime
+    const result = await mediaService.startDirectoryScan(dirPath, {
+      onBatch: (payload) => {
+        if (!sender.isDestroyed()) sender.send('media-metadata-updated', payload);
+      },
+      onComplete: (payload) => {
+        if (!sender.isDestroyed()) sender.send('media-metadata-complete', payload);
+      },
+      onError: (error) => {
+        if (!sender.isDestroyed()) {
+          sender.send('media-scan-error', { message: error && error.message ? error.message : '目录读取失败' });
+        }
+      }
+    });
+    sortMedia(result.items, sortMode, sortDir);
+    return result;
+  } catch (error) {
+    return { scanId: null, items: [], pendingCount: 0, error: error.message };
   }
+});
 
-  const stats = fs.statSync(filePath);
-  return buildDateInfo(stats.mtime);
-}
+ipcMain.handle('cancel-directory-scan', async () => {
+  if (mediaService) mediaService.cancelActiveScan();
+  return { success: true };
+});
 
-function buildDateInfo(date) {
-  const d = new Date(date);
-  if (isNaN(d.getTime())) {
-    return { date: '未知日期', year: '', month: '', day: '', hour: '' };
+// 缩略图和 RAW/大格式预览由主进程生成并缓存，渲染层只接收 file:// 地址。
+ipcMain.handle('get-thumbnail', async (event, filePath, size) => {
+  return mediaService ? mediaService.getThumbnail(filePath, size) : { success: false, error: '服务尚未初始化' };
+});
+
+ipcMain.handle('get-preview', async (event, filePath) => {
+  return mediaService ? mediaService.getPreview(filePath) : { success: false, error: '服务尚未初始化' };
+});
+
+ipcMain.handle('prepare-preview', async (event, filePath) => {
+  if (mediaService) mediaService.preparePreview(filePath);
+  return { success: true };
+});
+
+ipcMain.handle('get-subfolders', async (event, dirPath) => {
+  try {
+    return mediaService ? await mediaService.getSubfolders(dirPath) : [];
+  } catch (_) {
+    return [];
   }
-  const year = String(d.getFullYear());
-  const month = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  const hours = String(d.getHours()).padStart(2, '0');
-  const minutes = String(d.getMinutes()).padStart(2, '0');
-  return {
-    date: `${year}年${month}月${day}日 ${hours}:${minutes}`,
-    year: `${year}年`,
-    month: `${year}年${month}月`,
-    day: `${year}年${month}月${day}日`,
-    hour: `${year}年${month}月${day}日 ${hours}:00`
-  };
-}
+});
 
-// IPC Handlers
 ipcMain.handle('select-directory', async () => {
   const result = await dialog.showOpenDialog(win, {
     properties: ['openDirectory'],
@@ -119,78 +157,37 @@ ipcMain.handle('select-directory', async () => {
   return result.canceled ? null : { path: result.filePaths[0] };
 });
 
-ipcMain.handle('read-directory', async (event, dirPath, sortMode, sortDir) => {
-  try {
-    const files = fs.readdirSync(dirPath);
-    const mediaFiles = files.filter(f => {
-      const ext = path.extname(f).toLowerCase();
-      return mediaExts.includes(ext);
-    });
-
-    const media = await Promise.all(
-      mediaFiles.map(async (file) => {
-        const filePath = path.join(dirPath, file);
-        const stats = fs.statSync(filePath);
-        const ext = path.extname(file).toLowerCase();
-        const type = videoExts.includes(ext) ? 'video' : 'image';
-        const dateInfo = await getImageDate(filePath);
-        return { name: file, path: filePath, size: stats.size, mtime: stats.mtimeMs, type, ...dateInfo };
-      })
-    );
-
-    if (sortMode === 'filename') {
-      if (sortDir === 'asc') {
-        media.sort((a, b) => a.name.localeCompare(b.name, 'zh-CN', { numeric: true }));
-      } else {
-        media.sort((a, b) => b.name.localeCompare(a.name, 'zh-CN', { numeric: true }));
-      }
-    } else {
-      if (sortDir === 'desc') {
-        media.sort((a, b) => b.mtime - a.mtime);
-      } else {
-        media.sort((a, b) => a.mtime - b.mtime);
-      }
-    }
-
-    return media;
-  } catch (e) {
-    return [];
-  }
+// 收藏状态持久化在 userData 目录，不修改用户媒体文件。
+ipcMain.handle('toggle-favorite', async (event, filePath) => {
+  return mediaService ? mediaService.toggleFavorite(filePath) : { success: false };
 });
 
-ipcMain.handle('get-subfolders', async (event, dirPath) => {
-  try {
-    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
-    return entries
-      .filter(e => e.isDirectory() && !e.name.startsWith('.'))
-      .map(e => e.name)
-      .sort();
-  } catch (e) {
-    return [];
-  }
+ipcMain.handle('copy-file-path', async (event, filePath) => {
+  clipboard.writeText(filePath);
+  return { success: true };
 });
 
-// Directory watcher
+ipcMain.handle('show-file-in-explorer', async (event, filePath) => {
+  shell.showItemInFolder(filePath);
+  return { success: true };
+});
+
+// 目录监听仍采用 fs.watch，但将刷新消息合并到更短的 800ms 窗口。
 function startWatching(dirPath) {
   stopWatching();
-
   try {
     currentWatcher = fs.watch(dirPath, (eventType) => {
-      if (eventType === 'rename' || eventType === 'change') {
-        if (debounceTimer) clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(() => {
-          if (win && !win.isDestroyed()) {
-            win.webContents.send('directory-changed', dirPath);
-          }
-        }, 1500);
-      }
+      if (eventType !== 'rename' && eventType !== 'change') return;
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        if (win && !win.isDestroyed()) win.webContents.send('directory-changed', dirPath);
+      }, 800);
     });
-    currentWatcher.on('error', () => {
-      stopWatching();
-    });
+    currentWatcher.on('error', stopWatching);
     watchedPath = dirPath;
-  } catch (e) {
-    // Watch failed silently
+  } catch (_) {
+    currentWatcher = null;
+    watchedPath = null;
   }
 }
 
@@ -198,61 +195,50 @@ function stopWatching() {
   if (currentWatcher) {
     currentWatcher.close();
     currentWatcher = null;
-    watchedPath = null;
   }
+  watchedPath = null;
   if (debounceTimer) {
     clearTimeout(debounceTimer);
     debounceTimer = null;
   }
 }
 
-ipcMain.on('watch-directory', (event, dirPath) => {
-  startWatching(dirPath);
-});
+ipcMain.on('watch-directory', (event, dirPath) => startWatching(dirPath));
+ipcMain.on('unwatch-directory', () => stopWatching());
 
-ipcMain.on('unwatch-directory', () => {
-  stopWatching();
-});
-
-// File operation handlers
+// 文件操作统一使用异步 fs，避免大目录或网络盘操作造成主进程假死。
 ipcMain.handle('delete-file', async (event, filePath) => {
   const result = await dialog.showMessageBox(win, {
     type: 'warning',
     buttons: ['删除', '取消'],
     defaultId: 1,
     title: '确认删除',
-    message: `确定要删除这个文件吗？`,
+    message: '确定要删除这个文件吗？',
     detail: path.basename(filePath)
   });
   if (result.response !== 0) return { success: false };
   try {
     await shell.trashItem(filePath);
     return { success: true };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
 ipcMain.handle('delete-files', async (event, filePaths) => {
+  const paths = Array.isArray(filePaths) ? filePaths : [];
   const result = await dialog.showMessageBox(win, {
     type: 'warning',
     buttons: ['删除', '取消'],
     defaultId: 1,
     title: '确认删除',
-    message: `确定要删除这 ${filePaths.length} 个文件吗？`,
-    detail: filePaths.map(p => path.basename(p)).join('\n')
+    message: `确定要删除这 ${paths.length} 个文件吗？`,
+    detail: paths.map((item) => path.basename(item)).join('\n')
   });
   if (result.response !== 0) return { success: false };
 
-  let successCount = 0;
-  for (const filePath of filePaths) {
-    try {
-      await shell.trashItem(filePath);
-      successCount++;
-    } catch (e) {
-      // skip failed files
-    }
-  }
+  const outcomes = await Promise.allSettled(paths.map((filePath) => shell.trashItem(filePath)));
+  const successCount = outcomes.filter((item) => item.status === 'fulfilled').length;
   return { success: successCount > 0, successCount };
 });
 
@@ -260,41 +246,49 @@ ipcMain.handle('rename-file', async (event, filePath, newName) => {
   try {
     const dir = path.dirname(filePath);
     const ext = path.extname(filePath);
-    const nameWithoutExt = newName.includes('.') ? newName.replace(/\.[^.]+$/, '') : newName;
-    const finalName = nameWithoutExt + ext;
+    const cleanName = String(newName || '').trim();
+    if (!cleanName) return { success: false, error: '文件名不能为空' };
+    const nameWithoutExt = cleanName.includes('.') ? cleanName.replace(/\.[^.]+$/, '') : cleanName;
+    const finalName = `${nameWithoutExt}${ext}`;
     const newPath = path.join(dir, finalName);
-
     if (filePath === newPath) return { success: true, newPath: filePath };
-    if (fs.existsSync(newPath)) return { success: false, error: '文件已存在' };
-
-    fs.renameSync(filePath, newPath);
+    try {
+      await fsp.access(newPath);
+      return { success: false, error: '文件已存在' };
+    } catch (_) {}
+    await fsp.rename(filePath, newPath);
     return { success: true, newPath };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
 ipcMain.handle('move-file', async (event, filePath, destDir) => {
   try {
-    const fileName = path.basename(filePath);
-    const destPath = path.join(destDir, fileName);
-    if (fs.existsSync(destPath)) return { success: false, error: '目标文件夹已存在同名文件' };
-    fs.renameSync(filePath, destPath);
-    return { success: true };
-  } catch (e) {
-    return { success: false, error: e.message };
+    const destPath = path.join(destDir, path.basename(filePath));
+    if (filePath === destPath) return { success: false, error: '文件已在该目录' };
+    try {
+      await fsp.access(destPath);
+      return { success: false, error: '目标文件夹已存在同名文件' };
+    } catch (_) {}
+    await fsp.rename(filePath, destPath);
+    return { success: true, newPath: destPath };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
-// Folder operation handlers
 ipcMain.handle('create-folder', async (event, parentDir, folderName) => {
   try {
     const newPath = path.join(parentDir, folderName);
-    if (fs.existsSync(newPath)) return { success: false, error: '文件夹已存在' };
-    fs.mkdirSync(newPath);
+    try {
+      await fsp.access(newPath);
+      return { success: false, error: '文件夹已存在' };
+    } catch (_) {}
+    await fsp.mkdir(newPath);
     return { success: true, path: newPath };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
@@ -304,76 +298,66 @@ ipcMain.handle('delete-folder', async (event, dirPath) => {
     buttons: ['删除', '取消'],
     defaultId: 1,
     title: '确认删除文件夹',
-    message: `确定要删除这个文件夹吗？`,
+    message: '确定要删除这个文件夹吗？',
     detail: `${dirPath}\n\n文件夹内的所有内容都将被删除。`
   });
   if (result.response !== 0) return { success: false };
-  if (watchedPath && (watchedPath === dirPath || watchedPath.startsWith(dirPath + '\\'))) {
-    stopWatching();
-  }
+  if (watchedPath && (watchedPath === dirPath || watchedPath.startsWith(`${dirPath}${path.sep}`))) stopWatching();
   try {
     await shell.trashItem(dirPath);
     return { success: true };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
 ipcMain.handle('delete-folders', async (event, dirPaths) => {
+  const paths = Array.isArray(dirPaths) ? dirPaths : [];
   const result = await dialog.showMessageBox(win, {
     type: 'warning',
     buttons: ['删除', '取消'],
     defaultId: 1,
     title: '确认删除文件夹',
-    message: `确定要删除这 ${dirPaths.length} 个文件夹吗？`,
-    detail: dirPaths.map(p => path.basename(p)).join('\n') + '\n\n文件夹内的所有内容都将被删除。'
+    message: `确定要删除这 ${paths.length} 个文件夹吗？`,
+    detail: `${paths.map((item) => path.basename(item)).join('\n')}\n\n文件夹内的所有内容都将被删除。`
   });
   if (result.response !== 0) return { success: false };
-
-  if (watchedPath) {
-    for (const dirPath of dirPaths) {
-      if (watchedPath === dirPath || watchedPath.startsWith(dirPath + '\\')) {
-        stopWatching();
-        break;
-      }
-    }
+  if (watchedPath && paths.some((dirPath) => watchedPath === dirPath || watchedPath.startsWith(`${dirPath}${path.sep}`))) {
+    stopWatching();
   }
-
-  let successCount = 0;
-  for (const dirPath of dirPaths) {
-    try {
-      await shell.trashItem(dirPath);
-      successCount++;
-    } catch (e) {
-      // skip failed folders
-    }
-  }
+  const outcomes = await Promise.allSettled(paths.map((dirPath) => shell.trashItem(dirPath)));
+  const successCount = outcomes.filter((item) => item.status === 'fulfilled').length;
   return { success: successCount > 0, successCount };
 });
 
 ipcMain.handle('rename-folder', async (event, dirPath, newName) => {
   try {
-    const parentDir = path.dirname(dirPath);
-    const newPath = path.join(parentDir, newName);
+    const newPath = path.join(path.dirname(dirPath), String(newName || '').trim());
     if (dirPath === newPath) return { success: true, newPath: dirPath };
-    if (fs.existsSync(newPath)) return { success: false, error: '文件夹已存在' };
-    fs.renameSync(dirPath, newPath);
+    try {
+      await fsp.access(newPath);
+      return { success: false, error: '文件夹已存在' };
+    } catch (_) {}
+    await fsp.rename(dirPath, newPath);
     return { success: true, newPath };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
 ipcMain.handle('move-folder', async (event, srcPath, destDir) => {
   try {
-    const folderName = path.basename(srcPath);
-    const destPath = path.join(destDir, folderName);
+    const destPath = path.join(destDir, path.basename(srcPath));
     if (srcPath === destPath) return { success: false, error: '不能移动到自身' };
-    if (fs.existsSync(destPath)) return { success: false, error: '目标文件夹已存在同名文件夹' };
-    fs.renameSync(srcPath, destPath);
+    if (destPath.startsWith(`${srcPath}${path.sep}`)) return { success: false, error: '不能移动到自身子目录' };
+    try {
+      await fsp.access(destPath);
+      return { success: false, error: '目标文件夹已存在同名文件夹' };
+    } catch (_) {}
+    await fsp.rename(srcPath, destPath);
     return { success: true, newPath: destPath };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
@@ -381,21 +365,24 @@ ipcMain.handle('open-in-explorer', async (event, dirPath) => {
   try {
     await shell.openPath(dirPath);
     return { success: true };
-  } catch (e) {
-    return { success: false, error: e.message };
+  } catch (error) {
+    return { success: false, error: error.message };
   }
 });
 
-// Window control handlers
+// 自定义标题栏控制。
 ipcMain.on('window-minimize', () => win && win.minimize());
 ipcMain.on('window-maximize', () => {
-  if (win) {
-    win.isMaximized() ? win.unmaximize() : win.maximize();
-  }
+  if (!win) return;
+  win.isMaximized() ? win.unmaximize() : win.maximize();
 });
 ipcMain.on('window-close', () => win && win.close());
 
-app.whenReady().then(createWindow);
+app.whenReady().then(async () => {
+  mediaService = new MediaService({ userDataPath: app.getPath('userData') });
+  await mediaService.initialize();
+  createWindow();
+});
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
@@ -403,4 +390,13 @@ app.on('window-all-closed', () => {
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) createWindow();
+});
+
+// 退出前等待 ExifTool 子进程和缓存写入完成，避免遗留进程或缓存损坏。
+app.on('will-quit', (event) => {
+  if (isReadyToQuit || !mediaService) return;
+  event.preventDefault();
+  isReadyToQuit = true;
+  stopWatching();
+  mediaService.dispose().finally(() => app.exit(0));
 });

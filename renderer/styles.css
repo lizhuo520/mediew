@@ -1273,3 +1273,179 @@ body {
 #zoom-indicator.visible {
   opacity: 1;
 }
+
+/* ===== 性能与 RAW 界面增强 ===== */
+#media-toolbar {
+  height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 12px;
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.toolbar-search {
+  height: 30px;
+  min-width: 220px;
+  max-width: 520px;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 10px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  color: var(--text-secondary);
+}
+
+.toolbar-search:focus-within {
+  border-color: var(--accent-blue);
+}
+
+.toolbar-search input {
+  flex: 1;
+  min-width: 0;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text-primary);
+  font-size: 13px;
+}
+
+.toolbar-filter {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-color);
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-secondary);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.toolbar-filter:hover,
+.toolbar-filter.active {
+  color: var(--accent-blue);
+  border-color: var(--accent-blue);
+  background: rgba(29, 155, 240, 0.1);
+}
+
+#media-stats {
+  margin-left: auto;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+#main-content {
+  height: calc(100vh - 124px);
+}
+
+.image-card {
+  position: relative;
+  min-height: 150px;
+  content-visibility: auto;
+  contain-intrinsic-size: auto 240px;
+}
+
+.image-card .media-thumb {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  display: block;
+  object-fit: cover;
+}
+
+.image-card .image-loading {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  min-height: 0;
+  padding: 12px;
+  text-align: center;
+  background: var(--bg-card);
+}
+
+.image-card.thumbnail-loaded .image-loading {
+  display: none;
+}
+
+.image-card.thumbnail-error .image-loading {
+  color: #e0245e;
+}
+
+.video-thumb-wrapper {
+  position: relative;
+  width: 100%;
+  min-height: 150px;
+  background: var(--bg-card);
+}
+
+.video-thumb-wrapper .media-thumb {
+  width: 100%;
+  display: block;
+}
+
+.format-badge,
+.favorite-badge {
+  position: absolute;
+  z-index: 4;
+  top: 8px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  font-size: 10px;
+  line-height: 1.2;
+  pointer-events: none;
+  backdrop-filter: blur(6px);
+}
+
+.format-badge {
+  left: 8px;
+  color: #fff;
+  background: rgba(29, 155, 240, 0.9);
+}
+
+.favorite-badge {
+  right: 8px;
+  color: #ffd700;
+  font-size: 16px;
+  text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
+}
+
+.favorite-badge:empty {
+  display: none;
+}
+
+.image-card.favorite {
+  box-shadow: inset 0 0 0 1px rgba(255, 215, 0, 0.35);
+}
+
+.grid-loading,
+.load-more-sentinel {
+  column-span: all;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 48px;
+  color: var(--text-tertiary);
+  font-size: 13px;
+}
+
+.grid-mode .load-more-sentinel,
+.filename-mode .load-more-sentinel {
+  flex-basis: 100%;
+  width: 100%;
+}
+
+/* 滚动时关闭昂贵悬停合成，减少大量卡片滚动时的掉帧。 */
+html.is-scrolling .image-card:hover {
+  transform: none;
+  box-shadow: none;
+}
+
+:root[data-theme="light"] .format-badge {
+  color: #fff;
+}

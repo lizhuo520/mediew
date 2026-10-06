@@ -12,6 +12,7 @@ const Preview = {
   currentIndex: 0,
   isVideo: false,
   lastToggleTime: 0,
+  _previewToken: 0,
 
   scale: 1,
   fitScale: 1,
@@ -273,7 +274,10 @@ const Preview = {
   },
 
   close() {
+    this._previewToken += 1;
     this.modal.classList.remove('active');
+    this.image.onload = null;
+    this.image.onerror = null;
     this.image.src = '';
     this.image.classList.remove('loaded');
     this.video.src = '';
@@ -288,7 +292,7 @@ const Preview = {
     this.panY = 0;
   },
 
-  showImage() {
+  async showImage() {
     if (this.currentIndex < 0 || this.currentIndex >= this.imageList.length) return;
     const img = this.imageList[this.currentIndex];
     this.image.classList.remove('loaded');
@@ -309,35 +313,49 @@ const Preview = {
       document.getElementById('video-play').innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>';
       document.getElementById('video-progress').style.width = '0%';
       document.getElementById('video-time').textContent = '0:00 / 0:00';
-      this.video.src = `file:///${img.path.split(/[\\/]/).map(encodeURIComponent).join('/')}`;
+      this.video.src = Waterfall.getFileURL(img.path);
       this.video.load();
       this.updateNav();
       this.updateInfo(img);
 
       this.video.onloadedmetadata = () => {
-        document.getElementById('info-dimensions').textContent =
-          `${this.video.videoWidth} × ${this.video.videoHeight} px`;
+        document.getElementById('info-dimensions').textContent = `${this.video.videoWidth} × ${this.video.videoHeight} px`;
         this.video.currentTime = 0;
       };
 
       this.video.onerror = () => {
         const ext = img.name.split('.').pop().toLowerCase();
         const unsupported = ['avi', 'mkv', 'wmv', 'flv', 'm4v'];
-        const errorMsg = unsupported.includes(ext) ? '格式不支持' : '加载失败';
-        document.getElementById('info-dimensions').textContent = errorMsg;
+        document.getElementById('info-dimensions').textContent = unsupported.includes(ext) ? '格式不支持' : '加载失败';
       };
-    } else {
-      this.image.style.display = 'block';
-      this.container.classList.remove('video-mode');
-      this.image.src = `file:///${img.path.split(/[\\/]/).map(encodeURIComponent).join('/')}`;
-      this.updateNav();
-      this.updateInfo(img);
+      return;
+    }
 
-      if (this.image.complete && this.image.naturalWidth) {
-        this.onImageReady();
-      } else {
-        this.image.onload = () => this.onImageReady();
+    this.image.style.display = 'block';
+    this.container.classList.remove('video-mode');
+    this.updateNav();
+    this.updateInfo(img);
+    const token = ++this._previewToken;
+    this.image.onload = () => {
+      if (token === this._previewToken) this.onImageReady();
+    };
+    this.image.onerror = () => {
+      if (token === this._previewToken) document.getElementById('info-dimensions').textContent = '加载失败';
+    };
+
+    const extension = (img.extension || '').toLowerCase();
+    const needsGenerated = img.isRaw || ['.tif', '.tiff', '.heic', '.heif'].includes(extension);
+    if (needsGenerated) {
+      document.getElementById('info-dimensions').textContent = img.isRaw ? '正在生成 RAW 预览...' : '正在生成预览...';
+      const result = await window.api.getPreview(img.path);
+      if (token !== this._previewToken || !this.isOpen) return;
+      if (!result.success) {
+        document.getElementById('info-dimensions').textContent = result.error || '预览不可用';
+        return;
       }
+      this.image.src = result.url;
+    } else {
+      this.image.src = Waterfall.getFileURL(img.path);
     }
   },
 
@@ -351,22 +369,40 @@ const Preview = {
 
     const img = this.imageList[this.currentIndex];
     if (img) {
-      document.getElementById('info-dimensions').textContent =
-        `${this.image.naturalWidth} × ${this.image.naturalHeight} px`;
+      const suffix = img.isRaw ? ' · RAW 预览' : '';
+      document.getElementById('info-dimensions').textContent = `${this.image.naturalWidth} × ${this.image.naturalHeight} px${suffix}`;
+      this.prefetchAdjacent();
     }
+  },
+
+  prefetchAdjacent() {
+    const candidates = [this.imageList[this.currentIndex + 1], this.imageList[this.currentIndex - 1]];
+    candidates.forEach((item) => {
+      if (!item || item.type !== 'image') return;
+      const extension = (item.extension || '').toLowerCase();
+      if (item.isRaw || ['.tif', '.tiff', '.heic', '.heif'].includes(extension)) {
+        window.api.preparePreview(item.path);
+      }
+    });
   },
 
   updateInfo(img) {
     const filenameEl = document.getElementById('info-filename');
     filenameEl.textContent = img.name;
     filenameEl.title = img.name;
-    document.getElementById('info-dimensions').textContent = '加载中...';
+    document.getElementById('info-dimensions').textContent = img.width && img.height ? `${img.width} × ${img.height} px` : '加载中...';
     document.getElementById('info-filesize').textContent = this.formatSize(img.size);
-    document.getElementById('info-date').textContent = img.date;
+    document.getElementById('info-date').textContent = img.date || '未知日期';
+    document.getElementById('info-camera').textContent = img.camera || '-';
+    document.getElementById('info-lens').textContent = img.lens || '-';
+    const exposure = [img.aperture, img.shutter].filter(Boolean).join(' · ') || '-';
+    document.getElementById('info-exposure').textContent = exposure;
+    document.getElementById('info-iso').textContent = img.iso ? `ISO ${img.iso}` : '-';
+    document.getElementById('info-format').textContent = img.type === 'video'
+      ? '视频'
+      : (img.isRaw ? `RAW · ${img.rawFormat}` : (img.extension || '').replace('.', '').toUpperCase() || '图片');
     const infoTitle = document.querySelector('.info-title');
-    if (infoTitle) {
-      infoTitle.textContent = img.type === 'video' ? '视频信息' : '图片信息';
-    }
+    if (infoTitle) infoTitle.textContent = img.type === 'video' ? '视频信息' : (img.isRaw ? 'RAW 信息' : '图片信息');
   },
 
   formatSize(bytes) {
@@ -555,6 +591,10 @@ const Preview = {
           img.name = result.newPath.replace(/^.*[\\/]/, '');
           img.path = result.newPath;
           Waterfall.imageList[this.currentIndex] = img;
+          Waterfall.allImages.forEach((item) => {
+            if (item === img) return;
+            if (item.path === result.newPath || item.name === img.name) Object.assign(item, img);
+          });
         } else {
           App.fileOperationPending = false;
         }

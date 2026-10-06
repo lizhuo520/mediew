@@ -466,15 +466,13 @@ const FolderTree = {
 
   async createFolderItem(parentPath, folderName) {
     const fullPath = `${parentPath}\\${folderName}`;
-    const subfolders = await window.api.getSubfolders(fullPath);
-    const hasSubfolders = subfolders.length > 0;
-
     const wrapper = document.createElement('div');
     wrapper.className = 'folder-wrapper';
 
     const item = document.createElement('div');
     item.className = 'folder-item';
     item.dataset.path = fullPath;
+    item.dataset.childrenLoaded = 'false';
 
     const expandIcon = `
       <svg class="expand-icon" viewBox="0 0 24 24" fill="currentColor">
@@ -482,20 +480,15 @@ const FolderTree = {
       </svg>
     `;
 
-    item.innerHTML = `
-      ${expandIcon}
-      <span class="folder-name" title="${folderName}">${folderName}</span>
-    `;
-
-    item.addEventListener('click', (e) => {
-      e.stopPropagation();
-      this.handleFolderClick(e, item.dataset.path, item);
+    item.innerHTML = `${expandIcon}<span class="folder-name" title="${folderName}">${folderName}</span>`;
+    item.addEventListener('click', (event) => {
+      event.stopPropagation();
+      this.handleFolderClick(event, item.dataset.path, item);
     });
-
-    item.addEventListener('contextmenu', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      this.showContextMenu(e.clientX, e.clientY, item.dataset.path, false);
+    item.addEventListener('contextmenu', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      this.showContextMenu(event.clientX, event.clientY, item.dataset.path, false);
     });
 
     this.setupFolderDrag(item, fullPath);
@@ -504,22 +497,40 @@ const FolderTree = {
     const expandIconEl = item.querySelector('.expand-icon');
     const subList = document.createElement('div');
     subList.className = 'subfolder-list';
+    subList.dataset.loaded = 'false';
 
-    for (const sub of subfolders) {
-      const subItem = await this.createFolderItem(fullPath, sub);
-      subList.appendChild(subItem);
-    }
-
-    expandIconEl.addEventListener('click', (e) => {
-      e.stopPropagation();
-      expandIconEl.classList.toggle('expanded');
-      subList.classList.toggle('expanded');
+    expandIconEl.addEventListener('click', async (event) => {
+      event.stopPropagation();
+      await this.toggleFolderChildren(item, subList, fullPath, expandIconEl);
     });
 
     wrapper.appendChild(item);
     wrapper.appendChild(subList);
-
     return wrapper;
+  },
+
+  async toggleFolderChildren(item, subList, fullPath, expandIconEl) {
+    const willExpand = !subList.classList.contains('expanded');
+    if (!willExpand) {
+      subList.classList.remove('expanded');
+      expandIconEl.classList.remove('expanded');
+      return;
+    }
+
+    if (subList.dataset.loaded !== 'true') {
+      subList.dataset.loading = 'true';
+      const folders = await window.api.getSubfolders(fullPath);
+      for (const folder of folders) {
+        const child = await this.createFolderItem(fullPath, folder);
+        subList.appendChild(child);
+      }
+      subList.dataset.loaded = 'true';
+      delete subList.dataset.loading;
+      if (folders.length === 0) expandIconEl.style.visibility = 'hidden';
+    }
+
+    subList.classList.add('expanded');
+    expandIconEl.classList.add('expanded');
   },
 
   previewFolder(path, element) {
@@ -539,11 +550,8 @@ const FolderTree = {
     const expandIconEl = item.querySelector('.expand-icon');
     const wrapper = item.parentElement;
     const subList = wrapper ? wrapper.querySelector(':scope > .subfolder-list') : null;
-    if (expandIconEl && !expandIconEl.classList.contains('expanded')) {
-      expandIconEl.classList.add('expanded');
-    }
-    if (subList && !subList.classList.contains('expanded')) {
-      subList.classList.add('expanded');
+    if (subList && expandIconEl && !subList.classList.contains('expanded')) {
+      this.toggleFolderChildren(item, subList, path, expandIconEl);
     }
   },
 

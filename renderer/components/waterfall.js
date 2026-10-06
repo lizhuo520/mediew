@@ -20,7 +20,7 @@ const Waterfall = {
   _thumbnailObserver: null,
   _thumbnailQueue: [],
   _activeThumbnails: 0,
-  _thumbnailConcurrency: 4,
+  _thumbnailConcurrency: 6,
   _batchSize: 80,
   _cardImageMap: new WeakMap(),
 
@@ -132,7 +132,7 @@ const Waterfall = {
       });
     }, {
       root: this.container,
-      rootMargin: '700px 0px',
+      rootMargin: '900px 0px',
       threshold: 0.01
     });
   },
@@ -580,7 +580,7 @@ const Waterfall = {
       await this.loadVideoCard(card, imageInfo, generation);
       return;
     }
-    const result = await window.api.getThumbnail(imageInfo.path, 512);
+    const result = await window.api.getThumbnail(imageInfo.path, 384);
     if (generation !== this._generation || !card.isConnected) return;
     const image = card.querySelector('.media-thumb');
     if (!image) return;

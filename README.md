@@ -32,6 +32,7 @@ Mediew 不修改 RAW 原文件。显示 RAW 时的处理顺序如下：
 - 主进程使用异步 `readdir/stat`，不阻塞 Electron 事件循环。
 - 目录快照立即返回，EXIF 在后台分批补充，使用缓存和受限并发。
 - 元数据缓存位于 `%APPDATA%\mediew\metadata-cache.json`。
+- 网格缩略图默认输出 384 px，主进程最多 4 路并行生成。
 - 缩略图和预览缓存位于 `%APPDATA%\mediew\media-cache`。
 - 瀑布流按批次创建 DOM，避免一次创建数千张卡片。
 - 图片和视频只有接近视口时才加载，滚动时关闭高开销悬停合成。

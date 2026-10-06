@@ -11,6 +11,9 @@ const exifr = require('exifr');
 const { ExifTool } = require('exiftool-vendored');
 
 const { getMediaInfo } = require('./media-types');
+
+// 限制 sharp 内部线程数，将并行度留给多张缩略图任务，避免线程过度订阅。
+sharp.concurrency(2);
 const { createLimiter, mapWithConcurrency } = require('./concurrency');
 const { MetadataCache } = require('./metadata-cache');
 const {
@@ -123,7 +126,7 @@ class MediaService {
     });
 
     this.metadataLimiter = createLimiter(4);
-    this.thumbnailLimiter = createLimiter(3);
+    this.thumbnailLimiter = createLimiter(4);
     this.previewLimiter = createLimiter(2);
     this.thumbnailInflight = new Map();
     this.previewInflight = new Map();

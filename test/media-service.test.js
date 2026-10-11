@@ -6,7 +6,7 @@ const fs = require('node:fs');
 const fsp = fs.promises;
 const os = require('node:os');
 const path = require('node:path');
-const { fileURLToPath } = require('node:url');
+const { fileURLToPath, pathToFileURL } = require('node:url');
 const sharp = require('sharp');
 const { MediaService } = require('../services/media-service');
 
@@ -79,6 +79,147 @@ test('递归模式可读取子文件夹图片并保留相对路径', async () =>
   } finally {
     await service.dispose();
     await fsp.rm(mediaDir, { recursive: true, force: true });
+    await fsp.rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test('缩略图规格统一为最长边 640', async () => {
+  const userDataDir = await makeTempDirectory('mediew-size-norm-');
+  const service = new MediaService({ userDataPath: userDataDir });
+  await service.initialize();
+  try {
+    // 保留 size 参数只是为了兼容既有 IPC 调用，任何取值都归一到 640。
+    for (const requested of [undefined, null, 0, 256, 384, 512, 768, 4096]) {
+      assert.equal(service.normalizeThumbnailSize(requested), 640);
+    }
+  } finally {
+    await service.dispose();
+    await fsp.rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test('TIFF 可生成 640 缩略图、缓存预览并探测到宽高比', async () => {
+  const mediaDir = await makeTempDirectory('mediew-tiff-');
+  const userDataDir = await makeTempDirectory('mediew-tiff-user-');
+  const service = new MediaService({ userDataPath: userDataDir });
+  await service.initialize();
+  try {
+    // gkpv 的已知 bug：tif/tiff 能被扫描到，但 Chromium 解不了，
+    // readImageSize() 也没有 TIFF 分支，缩略图与灯箱预览都会失败。
+    // Mediew 走 sharp，下面这些断言就是该 bug 的回归保护。
+    const tiffPath = path.join(mediaDir, 'scan.tif');
+    await sharp({ create: { width: 1200, height: 900, channels: 3, background: '#123456' } })
+      .tiff()
+      .toFile(tiffPath);
+
+    const thumbnail = await service.getThumbnail(tiffPath, 640);
+    assert.equal(thumbnail.success, true, thumbnail.error);
+    const thumbPath = fileURLToPath(thumbnail.url);
+    assert.ok(fs.statSync(thumbPath).size > 0);
+    const thumbMeta = await sharp(thumbPath).metadata();
+    assert.equal(Math.max(thumbMeta.width, thumbMeta.height), 640);
+    assert.equal(thumbMeta.format, 'jpeg');
+
+    const cached = await service.getThumbnail(tiffPath, 640);
+    assert.equal(cached.success, true);
+    assert.equal(cached.fromCache, true);
+
+    // TIFF 浏览器不能直接显示，所以预览必须由主进程生成，而不是回原图。
+    const preview = await service.getPreview(tiffPath);
+    assert.equal(preview.success, true, preview.error);
+    assert.equal(preview.source, 'sharp');
+    assert.notEqual(preview.url, pathToFileURL(tiffPath).href);
+    const previewMeta = await sharp(fileURLToPath(preview.url)).metadata();
+    assert.equal(previewMeta.format, 'jpeg');
+    assert.ok(Math.max(previewMeta.width, previewMeta.height) <= 4096);
+    // 源图 1200x900 小于 4096，因此不放大，保持原始像素。
+    assert.equal(previewMeta.width, 1200);
+    assert.equal(previewMeta.height, 900);
+
+    // 宽高比探测：gkpv 的 readImageSize() 没有 TIFF 分支，拿不到比例。
+    const seen = [];
+    const result = await service.startDirectoryScan(mediaDir, {
+      onDimensions: (payload) => {
+        payload.items.forEach((item) => seen.push(item));
+      }
+    });
+    for (let i = 0; i < 60 && seen.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const probed = seen.find((item) => item.path === tiffPath);
+    assert.ok(probed, '应该通过维度通道推送 TIFF 的宽高');
+    assert.equal(probed.width, 1200);
+    assert.equal(probed.height, 900);
+    // enrichDimensions 直接改的是同一批 item 对象，因此扫描结果也应已带上尺寸。
+    assert.equal(result.items[0].width, 1200);
+    assert.equal(result.items[0].height, 900);
+  } finally {
+    await service.dispose();
+    await fsp.rm(mediaDir, { recursive: true, force: true });
+    await fsp.rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test('EXIF 方向 5~8 时 readMetadata 返回显示尺寸而非传感器尺寸', async () => {
+  const mediaDir = await makeTempDirectory('mediew-orient-');
+  const userDataDir = await makeTempDirectory('mediew-orient-user-');
+  const service = new MediaService({ userDataPath: userDataDir });
+  await service.initialize();
+  try {
+    // 像素 1200x1800 + Orientation=6 → 显示尺寸 1800x1200。
+    // 修前这里返回 1200x1800，导致竖拍照片的瀑布流占位比例反了。
+    const file = path.join(mediaDir, 'rotated.jpg');
+    await sharp({ create: { width: 1200, height: 1800, channels: 3, background: '#5f0ba5' } })
+      .withMetadata({ orientation: 6 })
+      .jpeg()
+      .toFile(file);
+
+    const stat = await fsp.stat(file);
+    const metadata = await service.readMetadata(file, {
+      type: 'image', isRaw: false, extension: '.jpg', mtime: stat.mtimeMs
+    });
+    assert.equal(metadata.orientation, 6);
+    if (metadata.width > 0 && metadata.height > 0) {
+      assert.equal(metadata.width, 1800, '宽度应为显示尺寸');
+      assert.equal(metadata.height, 1200, '高度应为显示尺寸');
+    }
+  } finally {
+    await service.dispose();
+    await fsp.rm(mediaDir, { recursive: true, force: true });
+    await fsp.rm(userDataDir, { recursive: true, force: true });
+  }
+});
+
+test('生成缩略图后源文件不会被占用（.webp / .gif 回归）', async () => {
+  const userDataDir = await makeTempDirectory('mediew-lock-user-');
+  const service = new MediaService({ userDataPath: userDataDir });
+  await service.initialize();
+  try {
+    // libvips 默认会缓存打开过的文件（含 mmap 映射）。Windows 上这会让
+    // .webp / .gif 的源文件在生成缩略图后长期无法删除/重命名/移动。
+    // 该行为已由 services/sharp-config.js 的 sharp.cache({ files: 0 }) 修掉，
+    // 这里的断言就是防止它被改回去。
+    const cases = [
+      ['webp', (base) => base.webp()],
+      ['gif', (base) => base.gif()],
+      ['jpg', (base) => base.jpeg()]
+    ];
+    for (const [ext, encode] of cases) {
+      const mediaDir = await makeTempDirectory(`mediew-lock-${ext}-`);
+      const source = path.join(mediaDir, `sample.${ext}`);
+      const base = sharp({ create: { width: 1600, height: 1200, channels: 3, background: '#204060' } });
+      await encode(base).toFile(source);
+
+      const thumbnail = await service.getThumbnail(source, 640);
+      assert.equal(thumbnail.success, true, `${ext}: ${thumbnail.error}`);
+
+      // 不加重试：如果句柄没释放，这里会直接 EBUSY 失败。
+      await fsp.unlink(source);
+      assert.ok(fs.statSync(fileURLToPath(thumbnail.url)).size > 0, `${ext} 缩略图缓存应仍然存在`);
+      await fsp.rm(mediaDir, { recursive: true, force: true });
+    }
+  } finally {
+    await service.dispose();
     await fsp.rm(userDataDir, { recursive: true, force: true });
   }
 });

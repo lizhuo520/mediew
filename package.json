@@ -8,7 +8,7 @@
     "build": "electron-builder --win",
     "build:zip": "electron-builder --win zip",
     "build:nsis": "electron-builder --win nsis",
-    "test": "node --test test/*.test.js"
+    "test": "node --test"
   },
   "dependencies": {
     "exifr": "^7.1.3",

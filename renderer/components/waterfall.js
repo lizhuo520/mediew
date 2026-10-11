@@ -20,9 +20,12 @@ const Waterfall = {
   _thumbnailObserver: null,
   _thumbnailQueue: [],
   _activeThumbnails: 0,
-  _thumbnailConcurrency: 6,
+  // 与 gkpv 的 THUMB_CONCURRENCY 一致：渲染层最多同时排队 8 个缩略图请求。
+  _thumbnailConcurrency: 8,
   _batchSize: 80,
   _cardImageMap: new WeakMap(),
+  _thumbnailFailed: 0,
+  _thumbnailFailedNames: [],
 
   zoomLevel: 1.0,
   ZOOM_MIN: 0.3,
@@ -69,6 +72,8 @@ const Waterfall = {
   setupMetadataListeners() {
     window.api.onMediaMetadataUpdated((payload) => this.handleMetadataBatch(payload));
     window.api.onMediaMetadataComplete((payload) => this.handleMetadataComplete(payload));
+    window.api.onMediaDimensionsUpdated((payload) => this.handleDimensionsBatch(payload));
+    window.api.onMediaDimensionsComplete((payload) => this.handleDimensionsComplete(payload));
     window.api.onMediaScanError((payload) => {
       this._scanProgress = null;
       this.updateStats(`扫描失败：${payload.message}`);
@@ -355,6 +360,8 @@ const Waterfall = {
     this._scanProgress = null;
     this._metadataDirty = false;
     this._scanBuffers.clear();
+    this._thumbnailFailed = 0;
+    this._thumbnailFailedNames = [];
     this.clearSelection();
 
     const sortMode = SettingsManager.getSortMode();
@@ -374,6 +381,7 @@ const Waterfall = {
   activateBufferedScan(scanId) {
     if (!scanId || !this._scanBuffers.has(scanId)) return;
     const buffered = this._scanBuffers.get(scanId);
+    buffered.dimensions.forEach((payload) => this.handleDimensionsBatch(payload, true));
     buffered.batches.forEach((payload) => this.handleMetadataBatch(payload, true));
     if (buffered.complete) this.handleMetadataComplete({ scanId }, true);
     this._scanBuffers.delete(scanId);
@@ -387,7 +395,17 @@ const Waterfall = {
     }
     payload.items.forEach((metadata) => {
       const target = this._allImageByPath.get(metadata.path);
-      if (target) Object.assign(target, metadata);
+      if (!target) return;
+      // PNG/WebP/GIF 通常没有 EXIF 尺寸，此时 readMetadata 会返回 width/height = 0。
+      // 直接 Object.assign 会把已经探测好的宽高比抹成 0，卡片就失去了占位比例
+      // （逐项实测：这三类格式会因此完全不占位）。所以只在 EXIF 确实给出尺寸时才覆盖。
+      const { width, height, ...rest } = metadata;
+      Object.assign(target, rest);
+      if (width > 0 && height > 0) {
+        target.width = width;
+        target.height = height;
+        this.applyCardAspect(target);
+      }
     });
     this._metadataDirty = true;
     this._scanProgress = { completed: payload.completed || 0, total: payload.total || 0 };
@@ -409,12 +427,55 @@ const Waterfall = {
     }
   },
 
+  /**
+   * 后台宽高比探测的增量结果。
+   * 只补写 width/height 并就地修正已渲染卡片的比例，不触发整屏重建。
+   */
+  handleDimensionsBatch(payload, force = false) {
+    if (!payload || !payload.scanId) return;
+    if (!force && payload.scanId !== this._scanId) {
+      this.bufferScanPayload(payload.scanId, 'dimensions', payload);
+      return;
+    }
+    payload.items.forEach((size) => {
+      const target = this._allImageByPath.get(size.path);
+      if (!target || target.width > 0) return;
+      target.width = size.width;
+      target.height = size.height;
+      this.applyCardAspect(target);
+    });
+  },
+
+  handleDimensionsComplete(payload) {
+    // 尺寸通道只影响占位比例，不影响分组/排序，因此不参与 _scanBuffers 的重放，
+    // 也不会和 EXIF 的 complete 标记互相干扰。
+    if (!payload || payload.scanId !== this._scanId) return;
+    this.updateStats();
+  },
+
+  /**
+   * 把已探测到的宽高比应用到已渲染的卡片上。
+   * 用属性选择器定位，与 toggleFavoriteCard / startRenameCard 的既有写法保持一致。
+   */
+  applyCardAspect(imageInfo) {
+    if (!imageInfo.width || !imageInfo.height) return;
+    const card = this.grid.querySelector(`.image-card[data-path="${CSS.escape(imageInfo.path)}"]`);
+    if (!card) return;
+    const image = card.querySelector('.media-thumb');
+    if (image) image.style.aspectRatio = `${imageInfo.width} / ${imageInfo.height}`;
+  },
+
   bufferScanPayload(scanId, key, value) {
-    if (!this._scanBuffers.has(scanId)) this._scanBuffers.set(scanId, { batches: [], complete: false });
+    if (!this._scanBuffers.has(scanId)) {
+      this._scanBuffers.set(scanId, { batches: [], dimensions: [], complete: false });
+    }
     const entry = this._scanBuffers.get(scanId);
     if (key === 'batches') {
       entry.batches.push(value);
       if (entry.batches.length > 100) entry.batches.shift();
+    } else if (key === 'dimensions') {
+      entry.dimensions.push(value);
+      if (entry.dimensions.length > 100) entry.dimensions.shift();
     } else {
       entry.complete = true;
     }
@@ -580,7 +641,7 @@ const Waterfall = {
       await this.loadVideoCard(card, imageInfo, generation);
       return;
     }
-    const result = await window.api.getThumbnail(imageInfo.path, 384);
+    const result = await window.api.getThumbnail(imageInfo.path, 640);
     if (generation !== this._generation || !card.isConnected) return;
     const image = card.querySelector('.media-thumb');
     if (!image) return;
@@ -588,7 +649,7 @@ const Waterfall = {
       this.showCardError(card, imageInfo.isRaw ? 'RAW 预览不可用' : '加载失败');
       return;
     }
-    image.src = result.url;
+    // 必须先注册回调再设置 src：命中内存缓存时 load 事件可能紧接着就触发。
     image.addEventListener('load', () => {
       if (generation !== this._generation) return;
       card.classList.add('thumbnail-loaded');
@@ -597,6 +658,7 @@ const Waterfall = {
     image.addEventListener('error', () => {
       this.showCardError(card, imageInfo.isRaw ? 'RAW 预览不可用' : '加载失败');
     }, { once: true });
+    image.src = result.url;
   },
 
   async loadVideoCard(card, imageInfo, generation) {
@@ -620,6 +682,21 @@ const Waterfall = {
     const loading = card.querySelector('.image-loading');
     if (loading) loading.textContent = message;
     card.classList.add('thumbnail-error');
+    this.noteThumbnailFailure(card.dataset.path, message);
+  },
+
+  /**
+   * 记录缩略图失败，让统计栏能显示「N 张缩略图失败」并支持悬停查看文件名。
+   * gkpv 同样把失败计入计数并保留前 50 个名字；否则用户只会看到空白卡片，
+   * 也不知道到底哪几张没加载出来。
+   */
+  noteThumbnailFailure(filePath, message) {
+    this._thumbnailFailed += 1;
+    if (this._thumbnailFailedNames.length < 50) {
+      const name = filePath ? this.getBasename(filePath) : '';
+      this._thumbnailFailedNames.push(name ? `${name}：${message}` : message);
+    }
+    this.updateStats();
   },
 
   createFilenameCard(imageInfo, index) {
@@ -665,8 +742,15 @@ const Waterfall = {
     image.className = 'media-thumb';
     image.alt = imageInfo.name;
     image.title = imageInfo.name;
-    image.loading = 'lazy';
+    // 注意：这里刻意不设置 loading="lazy"。
+    // 加载时机完全由 _thumbnailObserver（900px 预加载边距）控制，与 gkpv 一致；
+    // 再加一层原生懒加载会让视口外的卡片出现「src 已设置但 naturalWidth 恒为 0」
+    // 的状态，卡片会一直停在占位态，缩略图状态也不再可判定。
     image.decoding = 'async';
+    // 已知宽高比时先按比例占位，缩略图到达后不会引起瀑布流跳动。
+    if (imageInfo.width > 0 && imageInfo.height > 0) {
+      image.style.aspectRatio = `${imageInfo.width} / ${imageInfo.height}`;
+    }
     return image;
   },
 
@@ -789,7 +873,11 @@ const Waterfall = {
     if (rawCount) parts.push(`RAW ${rawCount}`);
     if (typeof SettingsManager !== 'undefined' && SettingsManager.getRecursiveMode()) parts.push('递归');
     if (this.selectedPaths.size) parts.push(`已选 ${this.selectedPaths.size}`);
-    this._statsElement.textContent = parts.join(' · ');
+    let text = parts.join(' · ');
+    // 失败也必须显式可见，否则空白卡片会被误认为「这张图就是这样」。
+    if (this._thumbnailFailed > 0) text += `（${this._thumbnailFailed} 张缩略图失败）`;
+    this._statsElement.textContent = text;
+    this._statsElement.title = this._thumbnailFailed > 0 ? this._thumbnailFailedNames.join('\n') : '';
   },
 
   startRenameCard(imageInfo) {

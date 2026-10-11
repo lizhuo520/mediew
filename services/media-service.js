@@ -6,14 +6,12 @@ const os = require('node:os');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { pathToFileURL } = require('node:url');
-const sharp = require('sharp');
+const sharp = require('./sharp-config');
 const exifr = require('exifr');
 const { ExifTool } = require('exiftool-vendored');
 
 const { getMediaInfo } = require('./media-types');
-
-// 限制 sharp 内部线程数，将并行度留给多张缩略图任务，避免线程过度订阅。
-sharp.concurrency(2);
+const { probeImageSize } = require('./image-size');
 const { createLimiter, mapWithConcurrency } = require('./concurrency');
 const { MetadataCache } = require('./metadata-cache');
 const {
@@ -25,10 +23,25 @@ const {
 
 // 限制 sharp 处理超大图片时的像素数，防止异常文件拖垮进程。
 const MAX_INPUT_PIXELS = 300000000;
+
+// 输出规格与 gkpv 对齐：
+// - 缩略图最长边 640、JPEG q0.8（gkpv 的 THUMB_MAX / THUMB_QUALITY）；
+// - 预览图最长边 4096、JPEG q0.92（gkpv 灯箱对 RAW 重编码使用 q0.92）。
+// 二者都只限制最长边，短边按比例，且不放大源图。
+const THUMBNAIL_MAX = 640;
+const THUMBNAIL_QUALITY = 80;
+const PREVIEW_MAX = 4096;
+const PREVIEW_QUALITY = 92;
+
+// 缓存内容版本号：缩略图/预览的语义变化时递增，旧条目会因为键变化而自动失效。
+const CACHE_VERSION = 'v2';
+
+// 宽高比探测的并发上限。sharp 只读文件头，属于轻量 IO 任务，
+// 但 Windows 上过高的并发会让磁盘队列变长，因此取 16。
+const DIMENSION_CONCURRENCY = 16;
 const SKIP_DIRECTORY_NAMES = new Set([
   'node_modules', '.git', '.svn', '.hg', '$recycle.bin', 'system volume information'
 ]);
-const THUMBNAIL_SIZES = [256, 384, 512, 768];
 const EXIF_PICK = [
   'DateTimeOriginal', 'DateTimeDigitized', 'CreateDate',
   'Make', 'Model', 'LensModel', 'LensID',
@@ -115,7 +128,12 @@ class MediaService {
     this.previewRoot = path.join(this.cacheRoot, 'previews');
     this.tempRoot = path.join(this.cacheRoot, 'temp');
     this.favoritesFile = path.join(userDataPath, 'favorites.json');
-    this.metadataCache = new MetadataCache(path.join(userDataPath, 'metadata-cache.json'));
+    // 缓存文件名带版本：v1 存的是未按 EXIF 方向转正的宽高，
+    // 会让竖拍照片的占位比例反过来，因此必须整体失效。
+    this.metadataCache = new MetadataCache(path.join(userDataPath, 'metadata-cache-v2.json'));
+    // 宽高比缓存单独存放：它在缩略图生成前就要用上，
+    // 与 EXIF 的「待补齐」状态（metadataPending）互不影响。
+    this.dimensionCache = new MetadataCache(path.join(userDataPath, 'dimension-cache.json'));
 
     // ExifTool 使用子进程池；限制进程数可避免 RAW 扫描占满全部 CPU。
     const maxProcs = Math.max(2, Math.min(4, os.cpus().length || 2));
@@ -142,6 +160,7 @@ class MediaService {
       fsp.mkdir(this.previewRoot, { recursive: true }),
       fsp.mkdir(this.tempRoot, { recursive: true }),
       this.metadataCache.load(),
+      this.dimensionCache.load(),
       this.loadFavorites()
     ]);
   }
@@ -185,6 +204,8 @@ class MediaService {
         }
       });
     }
+
+    this.scheduleDimensionProbe(scan, items);
 
     return { scanId, items, pendingCount: pending.length, recursive };
   }
@@ -246,6 +267,11 @@ class MediaService {
     const cached = this.metadataCache.get(filePath, signature);
     const fallback = buildDateInfo(stat.mtimeMs, 'mtime');
     const metadata = cached || {};
+    // 缓存命中的宽高比直接带上，渲染层首屏就能按真实比例占位；
+    // EXIF 之后写回同样的字段，因此把 dimensions 放在 metadata 之前让 EXIF 优先。
+    const dimensions = mediaInfo.type === 'image'
+      ? (this.dimensionCache.get(filePath, signature) || {})
+      : {};
     return {
       name: path.basename(filePath),
       path: filePath,
@@ -260,9 +286,78 @@ class MediaService {
       signature,
       favorite: this.favorites.has(filePath),
       ...fallback,
+      ...dimensions,
       ...metadata,
       metadataPending: !cached && mediaInfo.type === 'image'
     };
+  }
+
+  /**
+   * 宽高比探测采用「快照优先、后台补正」。
+   * 缓存命中项已经带着 width/height 返回，首屏即可按真实比例占位；
+   * 未命中的项在后台限流探测并增量推送，不阻塞首屏渲染。
+   * 目标与 gkpv 的 premeasureAspects 一致（消除缩略图到达后的跳动），
+   * 但不引入 gkpv 那种「等全部测量完再排版」的整屏等待。
+   */
+  scheduleDimensionProbe(scan, items) {
+    const targets = items.filter((item) => item.type === 'image' && !(item.width > 0 && item.height > 0));
+    if (targets.length === 0) {
+      queueMicrotask(() => {
+        if (!scan.cancelled && typeof scan.callbacks.onDimensionsComplete === 'function') {
+          scan.callbacks.onDimensionsComplete({ scanId: scan.scanId });
+        }
+      });
+      return;
+    }
+    this.enrichDimensions(scan, targets).catch((error) => {
+      if (!scan.cancelled && typeof scan.callbacks.onError === 'function') scan.callbacks.onError(error);
+    });
+  }
+
+  /**
+   * 后台分批探测宽高比。每批最多 24 条或间隔 150ms 推送一次，
+   * 与 EXIF 的增量推送保持同样的节流节奏。
+   */
+  async enrichDimensions(scan, targets) {
+    const total = targets.length;
+    let completed = 0;
+    let buffer = [];
+    let lastFlush = 0;
+
+    const flush = (force = false) => {
+      if (scan.cancelled || buffer.length === 0) return;
+      const now = Date.now();
+      if (!force && buffer.length < 24 && now - lastFlush < 150) return;
+      const items = buffer;
+      buffer = [];
+      lastFlush = now;
+      if (typeof scan.callbacks.onDimensions === 'function') {
+        scan.callbacks.onDimensions({ scanId: scan.scanId, items, completed, total });
+      }
+    };
+
+    await mapWithConcurrency(targets, DIMENSION_CONCURRENCY, async (item) => {
+      if (scan.cancelled) return;
+      let size = null;
+      try {
+        size = await probeImageSize(item.path, { maxInputPixels: MAX_INPUT_PIXELS });
+      } catch (_) {
+        size = null;
+      }
+      completed += 1;
+      // 探测失败不写缓存，也不推送：渲染层保留默认占位，下次访问可以重试。
+      if (!size) return;
+      item.width = size.width;
+      item.height = size.height;
+      this.dimensionCache.set(item.path, item.signature, { width: size.width, height: size.height });
+      buffer.push({ path: item.path, width: size.width, height: size.height });
+      flush(false);
+    });
+
+    flush(true);
+    if (!scan.cancelled && typeof scan.callbacks.onDimensionsComplete === 'function') {
+      scan.callbacks.onDimensionsComplete({ scanId: scan.scanId, total, completed });
+    }
   }
 
   /**
@@ -351,6 +446,12 @@ class MediaService {
       tags.ExifImageHeight || tags.ImageHeight,
       tags.ImageSize
     );
+    // EXIF 里的宽高是「传感器像素」尺寸，没有考虑 EXIF 方向。
+    // 瀑布流占位和信息面板需要的是「显示尺寸」，因此这里与 probeImageSize()
+    // 使用同一规则：Orientation 5~8 时交换宽高，保证与 sharp().rotate() 的
+    // 输出、以及 <img> 的实际朝向三者一致。
+    const orientation = Number(tags.Orientation) || 1;
+    const rotated = orientation >= 5 && orientation <= 8;
 
     return {
       ...dateInfo,
@@ -359,9 +460,9 @@ class MediaService {
       aperture: formatAperture(tags.FNumber || tags.ApertureValue),
       shutter: formatExposure(tags.ExposureTime || tags.ShutterSpeedValue),
       iso: normalizeIso(tags.ISO || tags.ISOSetting || tags.RecommendedExposureIndex),
-      width: dimensions.width,
-      height: dimensions.height,
-      orientation: Number(tags.Orientation) || 1,
+      width: rotated ? dimensions.height : dimensions.width,
+      height: rotated ? dimensions.width : dimensions.height,
+      orientation,
       metadataPending: false,
       metadataError: false
     };
@@ -381,7 +482,7 @@ class MediaService {
   /**
    * 返回标准图片或 RAW 的缓存缩略图。
    */
-  async getThumbnail(filePath, requestedSize = 512) {
+  async getThumbnail(filePath, requestedSize = THUMBNAIL_MAX) {
     const size = this.normalizeThumbnailSize(requestedSize);
     try {
       const stat = await fsp.stat(filePath);
@@ -397,7 +498,7 @@ class MediaService {
       if (this.thumbnailInflight.has(key)) return this.thumbnailInflight.get(key);
 
       const promise = this.thumbnailLimiter(async () => {
-        const result = await this.generateImage(filePath, target, size, mediaInfo);
+        const result = await this.generateImage(filePath, target, size, mediaInfo, THUMBNAIL_QUALITY);
         return {
           success: true,
           url: pathToFileURL(target).href,
@@ -441,7 +542,7 @@ class MediaService {
         };
       }
 
-      const key = this.createCacheKey(filePath, stat, 'preview-2560');
+      const key = this.createCacheKey(filePath, stat, `preview-${PREVIEW_MAX}`);
       const target = path.join(this.previewRoot, `${key}.jpg`);
       if (await fileExists(target)) {
         return { success: true, url: pathToFileURL(target).href, isRaw: mediaInfo.isRaw, source: 'cache' };
@@ -449,7 +550,7 @@ class MediaService {
       if (this.previewInflight.has(key)) return this.previewInflight.get(key);
 
       const promise = this.previewLimiter(async () => {
-        const result = await this.generateImage(filePath, target, 2560, mediaInfo);
+        const result = await this.generateImage(filePath, target, PREVIEW_MAX, mediaInfo, PREVIEW_QUALITY);
         return {
           success: true,
           url: pathToFileURL(target).href,
@@ -478,27 +579,28 @@ class MediaService {
     return { success: true };
   }
 
-  normalizeThumbnailSize(size) {
-    const numeric = Number(size) || 512;
-    return THUMBNAIL_SIZES.reduce((best, current) => (
-      Math.abs(current - numeric) < Math.abs(best - numeric) ? current : best
-    ), THUMBNAIL_SIZES[0]);
+  /**
+   * 缩略图只有唯一规格：最长边 640（与 gkpv 的 THUMB_MAX 一致，S/M/L 只影响显示大小）。
+   * 保留 size 参数是为了不破坏既有 IPC 调用，任何取值都会归一到该规格。
+   */
+  normalizeThumbnailSize() {
+    return THUMBNAIL_MAX;
   }
 
   createCacheKey(filePath, stat, variant) {
-    const signature = `${filePath}|${stat.size}|${Math.floor(stat.mtimeMs)}|${variant}`;
+    const signature = `${CACHE_VERSION}|${filePath}|${stat.size}|${Math.floor(stat.mtimeMs)}|${variant}`;
     return crypto.createHash('sha256').update(signature).digest('hex');
   }
 
   /**
    * 根据媒体格式选择 sharp 或 ExifTool 提取路径，并原子写入缓存文件。
    */
-  async generateImage(filePath, target, maxSize, mediaInfo) {
+  async generateImage(filePath, target, maxSize, mediaInfo, quality = THUMBNAIL_QUALITY) {
     const temporary = `${target}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     try {
       const result = mediaInfo.isRaw
-        ? await this.generateRawImage(filePath, temporary, maxSize, mediaInfo)
-        : await this.resizeWithSharp(filePath, temporary, maxSize);
+        ? await this.generateRawImage(filePath, temporary, maxSize, mediaInfo, quality)
+        : await this.resizeWithSharp(filePath, temporary, maxSize, quality);
       await this.commitTemporaryFile(temporary, target);
       return result;
     } catch (error) {
@@ -509,8 +611,9 @@ class MediaService {
 
   /**
    * 标准图片缩放。orientation 会自动应用，输出 progressive JPEG 以便浏览器渐进显示。
+   * 继续使用 mozjpeg：与 gkpv 的 Chromium 编码相比，同等 quality 下体积更小。
    */
-  async resizeWithSharp(source, targetPath, maxSize) {
+  async resizeWithSharp(source, targetPath, maxSize, quality = THUMBNAIL_QUALITY) {
     const inputOptions = { failOn: 'none', limitInputPixels: MAX_INPUT_PIXELS };
     if (typeof source === 'string') inputOptions.sequentialRead = true;
     await sharp(source, inputOptions)
@@ -522,7 +625,7 @@ class MediaService {
         withoutEnlargement: true
       })
       .jpeg({
-        quality: maxSize <= 512 ? 78 : 84,
+        quality,
         progressive: true,
         mozjpeg: true,
         chromaSubsampling: '4:2:0'
@@ -537,13 +640,13 @@ class MediaService {
    * 2. 其余格式优先提取相机内嵌 JPEG，兼容性最好且无需本机 LibRaw 编译；
    * 3. 最后再次回退 sharp，覆盖部分有效的 DNG/JPEG-in-RAW 变体。
    */
-  async generateRawImage(filePath, targetPath, maxSize, mediaInfo) {
+  async generateRawImage(filePath, targetPath, maxSize, mediaInfo, quality = THUMBNAIL_QUALITY) {
     let lastError = null;
     const preferSharp = ['.dng', '.tif', '.tiff'].includes(mediaInfo.extension);
 
     if (preferSharp) {
       try {
-        return await this.resizeWithSharp(filePath, targetPath, maxSize);
+        return await this.resizeWithSharp(filePath, targetPath, maxSize, quality);
       } catch (error) {
         lastError = error;
       }
@@ -555,7 +658,7 @@ class MediaService {
       try {
         const buffer = await this.exiftool.extractBinaryTagToBuffer(tagName, filePath);
         if (buffer && buffer.length > 0) {
-          await this.resizeWithSharp(buffer, targetPath, maxSize);
+          await this.resizeWithSharp(buffer, targetPath, maxSize, quality);
           return { source: `buffer:${tagName}` };
         }
       } catch (error) {
@@ -565,7 +668,7 @@ class MediaService {
 
     if (!preferSharp) {
       try {
-        return await this.resizeWithSharp(filePath, targetPath, maxSize);
+        return await this.resizeWithSharp(filePath, targetPath, maxSize, quality);
       } catch (error) {
         lastError = error;
       }
@@ -650,6 +753,7 @@ class MediaService {
     this.cancelActiveScan();
     await Promise.allSettled([
       this.metadataCache.flush(),
+      this.dimensionCache.flush(),
       this.saveFavorites(),
       this.exiftool.end()
     ]);

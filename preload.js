@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld('api', {
   onMediaMetadataUpdated: (callback) => subscribe('media-metadata-updated', callback),
   onMediaMetadataComplete: (callback) => subscribe('media-metadata-complete', callback),
   onMediaScanError: (callback) => subscribe('media-scan-error', callback),
+  onMediaDimensionsUpdated: (callback) => subscribe('media-dimensions-updated', callback),
+  onMediaDimensionsComplete: (callback) => subscribe('media-dimensions-complete', callback),
 
   getThumbnail: (filePath, size) => ipcRenderer.invoke('get-thumbnail', filePath, size),
   getPreview: (filePath) => ipcRenderer.invoke('get-preview', filePath),

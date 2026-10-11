@@ -13,6 +13,7 @@ const Preview = {
   isVideo: false,
   lastToggleTime: 0,
   _previewToken: 0,
+  _preloadImages: new Map(),
 
   scale: 1,
   fitScale: 1,
@@ -201,6 +202,18 @@ const Preview = {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   },
 
+  /**
+   * 灯箱取图策略（对齐 gkpv）：
+   * 浏览器能直接解码的格式一律加载原图，保留最高缩放质量；
+   * TIFF / HEIC / RAW 浏览器解不了，必须由主进程生成缓存 JPEG 预览。
+   */
+  needsGeneratedPreview(imageInfo) {
+    if (!imageInfo) return false;
+    if (imageInfo.isRaw) return true;
+    const extension = (imageInfo.extension || '').toLowerCase();
+    return ['.tif', '.tiff', '.heic', '.heif'].includes(extension);
+  },
+
   getViewSize() {
     const panel = document.querySelector('.preview-info-panel');
     const panelW = panel ? panel.offsetWidth : 0;
@@ -290,6 +303,8 @@ const Preview = {
     this.fitScale = 1;
     this.panX = 0;
     this.panY = 0;
+    for (const preload of this._preloadImages.values()) preload.src = '';
+    this._preloadImages.clear();
   },
 
   async showImage() {
@@ -343,14 +358,14 @@ const Preview = {
       if (token === this._previewToken) document.getElementById('info-dimensions').textContent = '加载失败';
     };
 
-    const extension = (img.extension || '').toLowerCase();
-    const needsGenerated = img.isRaw || ['.tif', '.tiff', '.heic', '.heif'].includes(extension);
-    if (needsGenerated) {
+    if (this.needsGeneratedPreview(img)) {
       document.getElementById('info-dimensions').textContent = img.isRaw ? '正在生成 RAW 预览...' : '正在生成预览...';
       const result = await window.api.getPreview(img.path);
       if (token !== this._previewToken || !this.isOpen) return;
       if (!result.success) {
         document.getElementById('info-dimensions').textContent = result.error || '预览不可用';
+        // 生成失败也要预热相邻项，避免连续翻页时每张都从零等待。
+        this.prefetchAdjacent();
         return;
       }
       this.image.src = result.url;
@@ -375,14 +390,31 @@ const Preview = {
     }
   },
 
+  /**
+   * 预热前后各一张，与 gkpv 的 lbPreloadAdjacent() 目标一致。
+   * 注意不循环：Mediew 的上一张/下一张在两端禁用，保持线性语义。
+   * 生成型格式交给主进程 preparePreview；可解码格式在渲染层用 <img> 预热解码，
+   * 等价于 gkpv 里 `const img = new Image(); img.src = url` 的做法。
+   * _preloadImages 是这些预热对象的唯一持有者，离开保留集合就释放。
+   */
   prefetchAdjacent() {
-    const candidates = [this.imageList[this.currentIndex + 1], this.imageList[this.currentIndex - 1]];
-    candidates.forEach((item) => {
+    const keep = new Set([this.currentIndex + 1, this.currentIndex - 1]);
+    for (const [index, preload] of this._preloadImages) {
+      if (keep.has(index)) continue;
+      preload.src = '';
+      this._preloadImages.delete(index);
+    }
+    keep.forEach((index) => {
+      const item = this.imageList[index];
       if (!item || item.type !== 'image') return;
-      const extension = (item.extension || '').toLowerCase();
-      if (item.isRaw || ['.tif', '.tiff', '.heic', '.heif'].includes(extension)) {
+      if (this.needsGeneratedPreview(item)) {
         window.api.preparePreview(item.path);
+        return;
       }
+      if (this._preloadImages.has(index)) return;
+      const preload = new Image(); // 只是让浏览器提前解码
+      preload.src = Waterfall.getFileURL(item.path);
+      this._preloadImages.set(index, preload);
     });
   },
 

@@ -1357,6 +1357,13 @@ body {
   width: 100%;
   display: block;
   object-fit: cover;
+  /* 缩略图生成完成后淡入，避免硬切；与 gkpv 的 `.card img.loaded` 一致。 */
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.image-card.thumbnail-loaded .media-thumb {
+  opacity: 1;
 }
 
 .image-card .image-loading {
@@ -1366,7 +1373,17 @@ body {
   min-height: 0;
   padding: 12px;
   text-align: center;
-  background: var(--bg-card);
+  background-color: var(--bg-card);
+  /* 占位 shimmer：1.5s 循环的扫光，与 gkpv 的 `.card::before` 一致。 */
+  background-image: linear-gradient(100deg, transparent 20%, rgba(255, 255, 255, 0.06) 40%, transparent 60%);
+  background-size: 200% 100%;
+  background-repeat: no-repeat;
+  animation: media-shimmer 1.5s linear infinite;
+}
+
+@keyframes media-shimmer {
+  from { background-position: 200% 0; }
+  to { background-position: -200% 0; }
 }
 
 .image-card.thumbnail-loaded .image-loading {
@@ -1375,6 +1392,16 @@ body {
 
 .image-card.thumbnail-error .image-loading {
   color: #e0245e;
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .image-card .image-loading {
+    animation: none;
+  }
+  .image-card .media-thumb {
+    transition: none;
+  }
 }
 
 .video-thumb-wrapper {

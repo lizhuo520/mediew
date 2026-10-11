@@ -110,6 +110,14 @@ ipcMain.handle('read-directory', async (event, dirPath, sortMode, sortDir, recur
       onComplete: (payload) => {
         if (!sender.isDestroyed()) sender.send('media-metadata-complete', payload);
       },
+      // 宽高比探测结果单独走一条通道：它比 EXIF 先到达，
+      // 用于在缩略图生成前就按真实比例占位，避免瀑布流跳动。
+      onDimensions: (payload) => {
+        if (!sender.isDestroyed()) sender.send('media-dimensions-updated', payload);
+      },
+      onDimensionsComplete: (payload) => {
+        if (!sender.isDestroyed()) sender.send('media-dimensions-complete', payload);
+      },
       onError: (error) => {
         if (!sender.isDestroyed()) {
           sender.send('media-scan-error', { message: error && error.message ? error.message : '目录读取失败' });

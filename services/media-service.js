@@ -81,6 +81,23 @@ async function safeUnlink(filePath) {
 }
 
 /**
+ * 合并元数据，但绝不用「缺失的尺寸」覆盖已经探测好的宽高比。
+ * PNG/WebP/GIF 通常没有 EXIF 尺寸，readMetadata 会返回 width/height = 0；
+ * 直接 Object.assign 会让瀑布流丢掉占位比例（卡片会在缩略图到达后跳动）。
+ * 返回 true 表示这次合并提供了有效尺寸。
+ */
+function mergeMetadata(target, metadata) {
+  const { width, height, ...rest } = metadata;
+  Object.assign(target, rest);
+  if (width > 0 && height > 0) {
+    target.width = width;
+    target.height = height;
+    return true;
+  }
+  return false;
+}
+
+/**
  * 清洗 EXIF 字符串，避免对象或多行文本直接显示到界面。
  */
 function normalizeText(value) {
@@ -266,13 +283,9 @@ class MediaService {
     const signature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
     const cached = this.metadataCache.get(filePath, signature);
     const fallback = buildDateInfo(stat.mtimeMs, 'mtime');
-    const metadata = cached || {};
-    // 缓存命中的宽高比直接带上，渲染层首屏就能按真实比例占位；
-    // EXIF 之后写回同样的字段，因此把 dimensions 放在 metadata 之前让 EXIF 优先。
-    const dimensions = mediaInfo.type === 'image'
-      ? (this.dimensionCache.get(filePath, signature) || {})
-      : {};
-    return {
+    const dimensions = mediaInfo.type === 'image' ? this.dimensionCache.get(filePath, signature) : null;
+
+    const item = {
       name: path.basename(filePath),
       path: filePath,
       relativePath,
@@ -286,10 +299,18 @@ class MediaService {
       signature,
       favorite: this.favorites.has(filePath),
       ...fallback,
-      ...dimensions,
-      ...metadata,
+      width: 0,
+      height: 0,
       metadataPending: !cached && mediaInfo.type === 'image'
     };
+
+    // 先用缓存的宽高比占位；EXIF 尺寸更权威，但为 0 时不能反过来覆盖它。
+    if (dimensions && dimensions.width > 0 && dimensions.height > 0) {
+      item.width = dimensions.width;
+      item.height = dimensions.height;
+    }
+    if (cached) mergeMetadata(item, cached);
+    return item;
   }
 
   /**
@@ -396,8 +417,10 @@ class MediaService {
       }
 
       this.metadataCache.set(item.path, item.signature, metadata);
-      Object.assign(item, metadata);
-      buffer.push({ path: item.path, ...metadata });
+      // 不能用 EXIF 里缺失的尺寸（0）覆盖已经探测好的宽高比。
+      mergeMetadata(item, metadata);
+      // 推送的载荷统一带上「当前已知的最佳尺寸」，避免渲染层收到 0。
+      buffer.push({ path: item.path, ...metadata, width: item.width, height: item.height });
       completed += 1;
       flush(false);
     });

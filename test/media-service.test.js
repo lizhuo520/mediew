@@ -14,6 +14,14 @@ async function makeTempDirectory(prefix) {
   return fsp.mkdtemp(path.join(os.tmpdir(), prefix));
 }
 
+/**
+ * Windows 上元数据缓存的原子写入（rename）与 sharp 的文件句柄可能略有滞后，
+ * 直接 rm 会偶发 EBUSY / ENOTEMPTY。这里带退避重试，避免清理失败掩盖断言结果。
+ */
+async function removeTempDirectory(dir) {
+  await fsp.rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+}
+
 test('目录扫描、后台元数据与缩略图缓存可工作', async () => {
   const mediaDir = await makeTempDirectory('mediew-media-');
   const userDataDir = await makeTempDirectory('mediew-user-');
@@ -46,8 +54,8 @@ test('目录扫描、后台元数据与缩略图缓存可工作', async () => {
     assert.equal(cached.fromCache, true);
   } finally {
     await service.dispose();
-    await fsp.rm(mediaDir, { recursive: true, force: true });
-    await fsp.rm(userDataDir, { recursive: true, force: true });
+    await removeTempDirectory(mediaDir);
+    await removeTempDirectory(userDataDir);
   }
 });
 
@@ -78,8 +86,8 @@ test('递归模式可读取子文件夹图片并保留相对路径', async () =>
     assert.equal(nested.folder, path.join('child', 'grandchild'));
   } finally {
     await service.dispose();
-    await fsp.rm(mediaDir, { recursive: true, force: true });
-    await fsp.rm(userDataDir, { recursive: true, force: true });
+    await removeTempDirectory(mediaDir);
+    await removeTempDirectory(userDataDir);
   }
 });
 
@@ -94,7 +102,7 @@ test('缩略图规格统一为最长边 640', async () => {
     }
   } finally {
     await service.dispose();
-    await fsp.rm(userDataDir, { recursive: true, force: true });
+    await removeTempDirectory(userDataDir);
   }
 });
 
@@ -155,8 +163,50 @@ test('TIFF 可生成 640 缩略图、缓存预览并探测到宽高比', async (
     assert.equal(result.items[0].height, 900);
   } finally {
     await service.dispose();
-    await fsp.rm(mediaDir, { recursive: true, force: true });
-    await fsp.rm(userDataDir, { recursive: true, force: true });
+    await removeTempDirectory(mediaDir);
+    await removeTempDirectory(userDataDir);
+  }
+});
+
+test('宽高比探测结果会持久化，重启后二次扫描直接命中', async () => {
+  const mediaDir = await makeTempDirectory('mediew-dimcache-');
+  const userDataDir = await makeTempDirectory('mediew-dimcache-user-');
+  const file = path.join(mediaDir, 'plain.png');
+  // 用 PNG：它没有 EXIF 尺寸，宽高只能来自探测，因此能真正验证缓存链路。
+  await sharp({ create: { width: 800, height: 400, channels: 3, background: '#135724' } }).png().toFile(file);
+
+  const first = new MediaService({ userDataPath: userDataDir });
+  await first.initialize();
+  try {
+    const seen = [];
+    await first.startDirectoryScan(mediaDir, { onDimensions: (payload) => seen.push(...payload.items) });
+    for (let i = 0; i < 60 && seen.length === 0; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    assert.equal(seen.length, 1, '首次扫描应推送一次宽高比');
+    assert.equal(seen[0].width, 800);
+    assert.equal(seen[0].height, 400);
+  } finally {
+    // dispose 会把 dimension-cache.json 落盘
+    await first.dispose();
+  }
+
+  const second = new MediaService({ userDataPath: userDataDir });
+  await second.initialize();
+  try {
+    const seenAgain = [];
+    const result = await second.startDirectoryScan(mediaDir, {
+      onDimensions: (payload) => seenAgain.push(...payload.items)
+    });
+    // 缓存命中时 createBaseItem 会同步带上宽高，不依赖后台探测。
+    assert.equal(result.items[0].width, 800, '重启后应直接命中缓存的宽度');
+    assert.equal(result.items[0].height, 400);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(seenAgain.length, 0, '缓存命中时不应再推送宽高比批次');
+  } finally {
+    await second.dispose();
+    await removeTempDirectory(mediaDir);
+    await removeTempDirectory(userDataDir);
   }
 });
 
@@ -185,8 +235,8 @@ test('EXIF 方向 5~8 时 readMetadata 返回显示尺寸而非传感器尺寸',
     }
   } finally {
     await service.dispose();
-    await fsp.rm(mediaDir, { recursive: true, force: true });
-    await fsp.rm(userDataDir, { recursive: true, force: true });
+    await removeTempDirectory(mediaDir);
+    await removeTempDirectory(userDataDir);
   }
 });
 
@@ -216,11 +266,11 @@ test('生成缩略图后源文件不会被占用（.webp / .gif 回归）', asyn
       // 不加重试：如果句柄没释放，这里会直接 EBUSY 失败。
       await fsp.unlink(source);
       assert.ok(fs.statSync(fileURLToPath(thumbnail.url)).size > 0, `${ext} 缩略图缓存应仍然存在`);
-      await fsp.rm(mediaDir, { recursive: true, force: true });
+      await removeTempDirectory(mediaDir);
     }
   } finally {
     await service.dispose();
-    await fsp.rm(userDataDir, { recursive: true, force: true });
+    await removeTempDirectory(userDataDir);
   }
 });
 
@@ -246,6 +296,6 @@ test('真实 RAW 样片可生成缓存缩略图与预览', { skip: !process.env.
     assert.ok(fs.statSync(fileURLToPath(preview.url)).size > 0);
   } finally {
     await service.dispose();
-    await fsp.rm(userDataDir, { recursive: true, force: true });
+    await removeTempDirectory(userDataDir);
   }
 });

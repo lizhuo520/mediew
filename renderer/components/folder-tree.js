@@ -1,3 +1,35 @@
+'use strict';
+
+// 文件夹名会拼进 innerHTML，必须先转义：名字里带 < > & " 的目录
+// 会把结构拆坏（甚至注入标记），而目录名是用户可以任意取的。
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function baseName(targetPath) {
+  return String(targetPath || '').split(/[\\/]/).filter(Boolean).pop() || String(targetPath || '');
+}
+
+// 拼接子路径时保持父路径的分隔符风格，不再硬编码反斜杠。
+function joinPath(parent, child) {
+  const base = String(parent || '').replace(/[\\/]+$/, '');
+  // "C:" 这种只有盘符的情况按 Windows 习惯补反斜杠
+  const sep = (base.includes('\\') || /^[A-Za-z]:$/.test(base)) ? '\\' : '/';
+  return `${base}${sep}${child}`;
+}
+
+// 上一级目录，同样不假设分隔符是反斜杠。
+function dirName(targetPath) {
+  const trimmed = String(targetPath || '').replace(/[\\/]+$/, '');
+  const cut = Math.max(trimmed.lastIndexOf('\\'), trimmed.lastIndexOf('/'));
+  return cut <= 0 ? '' : trimmed.slice(0, cut);
+}
+
 const FolderTree = {
   container: null,
   rootPath: null,
@@ -6,6 +38,8 @@ const FolderTree = {
 
   selectedFolders: new Set(),
   lastClickedFolderIndex: -1,
+  // roving tabindex 的落点，重载目录树后靠它决定 Tab 进到哪一项
+  _treeIndex: -1,
   _isSelecting: false,
   _selectBox: null,
   _selectStartX: 0,
@@ -15,8 +49,167 @@ const FolderTree = {
   init(containerId, onFolderPreview) {
     this.container = document.getElementById(containerId);
     this.onFolderPreview = onFolderPreview;
+    // 树用 role="tree" + roving tabindex：Tab 只落到"当前文件夹"一项上，
+    // 层级内部靠方向键走（左收右展、上下移动），与 Windows 资源管理器一致。
+    if (this.container) {
+      this.container.setAttribute('role', 'tree');
+      this.container.setAttribute('aria-label', '文件夹');
+      this.container.addEventListener('keydown', (event) => this.handleTreeKeydown(event));
+    }
     this.setupContextMenu();
     this.setupSelection();
+    // 容器上的放置区只装一次：原先放在 loadFolders 里，每换一次目录就多叠一层
+    // 监听器，同一次拖放会被执行 N 遍。
+    this.setupContainerDropZone();
+  },
+
+  // ---------- 键盘可达性 ----------
+  applyItemAccessibility(item, folderName) {
+    item.setAttribute('role', 'treeitem');
+    item.setAttribute('aria-label', folderName);
+    item.tabIndex = -1;
+  },
+
+  syncTreeRovingTabIndex(preferredIndex) {
+    const items = this._getVisibleFolderItems();
+    if (items.length === 0) {
+      this._treeIndex = -1;
+      return;
+    }
+    let index;
+    if (typeof preferredIndex === 'number' && preferredIndex >= 0) {
+      index = Math.min(preferredIndex, items.length - 1);
+    } else if (this._treeIndex >= 0) {
+      index = Math.min(this._treeIndex, items.length - 1);
+    } else {
+      index = 0;
+    }
+    items.forEach((item, position) => { item.tabIndex = position === index ? 0 : -1; });
+    this._treeIndex = index;
+  },
+
+  focusFolderItemAt(index, options = {}) {
+    const items = this._getVisibleFolderItems();
+    if (items.length === 0) return null;
+    const safeIndex = Math.max(0, Math.min(index, items.length - 1));
+    const item = items[safeIndex];
+    this.syncTreeRovingTabIndex(safeIndex);
+    item.focus({ preventScroll: true });
+    if (options.scrollIntoView !== false) {
+      item.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    return item;
+  },
+
+  focusedFolderItem() {
+    const active = document.activeElement;
+    if (active && active.classList && active.classList.contains('folder-item')) return active;
+    return null;
+  },
+
+  // 方向键的"上下"按肉眼顺序走：DOM 里每层的 .folder-item 是按先父后子的次序铺开的，
+  // 直接取所有可见（已展开）项的下标就是视觉顺序。
+  handleTreeKeydown(event) {
+    if (event.defaultPrevented) return;
+    if (!event.target.closest || !event.target.closest('.folder-item')) return;
+
+    const items = this._getVisibleFolderItems();
+    if (items.length === 0) return;
+    const current = this.focusedFolderItem();
+    const currentIndex = current ? items.indexOf(current) : this._treeIndex;
+
+    switch (event.key) {
+      case 'ArrowDown':
+        event.preventDefault();
+        this.focusFolderItemAt(currentIndex + 1);
+        break;
+      case 'ArrowUp':
+        event.preventDefault();
+        this.focusFolderItemAt(currentIndex - 1);
+        break;
+      case 'Home':
+        event.preventDefault();
+        this.focusFolderItemAt(0);
+        break;
+      case 'End':
+        event.preventDefault();
+        this.focusFolderItemAt(items.length - 1);
+        break;
+      case 'ArrowRight':
+        event.preventDefault();
+        this.expandFocusedFolder(current);
+        break;
+      case 'ArrowLeft':
+        event.preventDefault();
+        this.collapseFocusedFolder(current);
+        break;
+      case 'Enter':
+      case ' ':
+      case 'Spacebar': {
+        event.preventDefault();
+        if (!current) return;
+        const path = current.dataset.path;
+        if (path) this.handleFolderClick({ ctrlKey: false, shiftKey: false }, path, current);
+        break;
+      }
+      case 'F2':
+        event.preventDefault();
+        if (current && current.dataset.path && !current.classList.contains('root-folder')) {
+          this.handleRenameFolder(current.dataset.path);
+        }
+        break;
+      case 'Delete':
+        event.preventDefault();
+        if (current && current.dataset.path && !current.classList.contains('root-folder')) {
+          if (this.selectedFolders.size > 1) this.handleBatchDeleteFolders();
+          else this.handleDeleteFolder(current.dataset.path);
+        }
+        break;
+      case 'Escape':
+        event.preventDefault();
+        this.clearSelection();
+        break;
+      default:
+        break;
+    }
+  },
+
+  findParentItem(item) {
+    const subList = item.closest('.subfolder-list');
+    if (!subList || !subList.parentElement) return null;
+    return subList.parentElement.querySelector(':scope > .folder-item');
+  },
+
+  itemSubList(item) {
+    if (!item.parentElement) return null;
+    return item.parentElement.querySelector(':scope > .subfolder-list');
+  },
+
+  async expandFocusedFolder(item) {
+    if (!item) return;
+    const subList = this.itemSubList(item);
+    if (!subList) return;
+    if (subList.classList.contains('expanded')) {
+      // 已经展开了，右箭头按标准树行为进入第一个子项
+      const items = this._getVisibleFolderItems();
+      const index = items.indexOf(item);
+      if (index >= 0 && items[index + 1]) this.focusFolderItemAt(index + 1);
+      return;
+    }
+    await this.toggleFolderChildren(item, subList, item.dataset.path, item.querySelector('.expand-icon'));
+  },
+
+  collapseFocusedFolder(item) {
+    if (!item) return;
+    const subList = this.itemSubList(item);
+    if (subList && subList.classList.contains('expanded')) {
+      this.toggleFolderChildren(item, subList, item.dataset.path, item.querySelector('.expand-icon'));
+      return;
+    }
+    // 已是收起状态：左箭头按标准树行为回到父项
+    const parent = this.findParentItem(item);
+    if (!parent) return;
+    this.focusFolderItemAt(this._getVisibleFolderItems().indexOf(parent));
   },
 
   setupContextMenu() {
@@ -145,11 +338,15 @@ const FolderTree = {
     this.lastClickedFolderIndex = -1;
     this.container.querySelectorAll('.folder-item.selected').forEach(el => {
       el.classList.remove('selected');
+      el.setAttribute('aria-selected', 'false');
     });
   },
 
   _getVisibleFolderItems() {
-    return Array.from(this.container.querySelectorAll('.folder-item'));
+    // 收起的分支是 display:none 但仍在 DOM 里，必须按渲染状态过滤：
+    // 否则方向键会走到看不见的项上（框选也会把折叠里的项一起选中）。
+    return Array.from(this.container.querySelectorAll('.folder-item'))
+      .filter((item) => item.offsetParent !== null);
   },
 
   _getVisibleFolderIndex(item) {
@@ -186,9 +383,12 @@ const FolderTree = {
       this.clearSelection();
       this.selectedFolders.add(fullPath);
       item.classList.add('selected');
+      item.setAttribute('aria-selected', 'true');
       this.lastClickedFolderIndex = this._getVisibleFolderIndex(item);
       this.previewFolder(fullPath, item);
     }
+    // 鼠标点中的那一项同时成为 Tab 的落点
+    this.syncTreeRovingTabIndex(this._getVisibleFolderIndex(item));
   },
 
   showContextMenu(x, y, dirPath, isRoot) {
@@ -259,7 +459,10 @@ const FolderTree = {
     }
 
     const result = await window.api.createFolder(parentDir, name);
-    if (!result.success) return;
+    if (!result.success) {
+      Toast.error(result.error || '新建文件夹失败');
+      return;
+    }
 
     App.fileOperationPending = true;
     const parentItem = this.findWrapper(parentDir);
@@ -334,6 +537,7 @@ const FolderTree = {
           return;
         } else {
           App.fileOperationPending = false;
+          Toast.error(result.error || '重命名文件夹失败');
         }
       }
       restored.textContent = currentName;
@@ -354,6 +558,8 @@ const FolderTree = {
     const result = await window.api.deleteFolder(dirPath);
     if (!result.success) {
       App.fileOperationPending = false;
+      // 没有 error 说明是用户在确认框里点了取消
+      if (result.error) Toast.error(result.error);
       return;
     }
     App._lastOpTime = Date.now();
@@ -369,7 +575,7 @@ const FolderTree = {
     }
 
     if (App.currentPath === dirPath || App.currentPreviewPath === dirPath) {
-      const parentPath = dirPath.substring(0, dirPath.lastIndexOf('\\'));
+      const parentPath = dirName(dirPath);
       const targetPath = parentPath && parentPath.startsWith(this.rootPath) ? parentPath : this.rootPath;
       App.currentPath = targetPath;
       App.currentPreviewPath = targetPath;
@@ -392,6 +598,8 @@ const FolderTree = {
     const result = await window.api.deleteFolders(paths);
     if (!result.success) {
       App.fileOperationPending = false;
+      if (result.error) Toast.error(result.error);
+      else if (result.successCount === 0) Toast.error('删除文件夹失败，可能正被其他程序占用');
       return;
     }
     App._lastOpTime = Date.now();
@@ -424,7 +632,7 @@ const FolderTree = {
     this.container.innerHTML = '';
     this.clearSelection();
 
-    const rootName = dirPath.split('\\').pop() || dirPath.split('/').pop() || dirPath;
+    const rootName = baseName(dirPath) || dirPath;
     const rootWrapper = document.createElement('div');
     rootWrapper.className = 'folder-wrapper';
 
@@ -432,7 +640,7 @@ const FolderTree = {
     rootItem.className = 'folder-item root-folder';
     rootItem.dataset.path = dirPath;
     rootItem.innerHTML = `
-      <span class="folder-name" title="${rootName}">${rootName}</span>
+      <span class="folder-name" title="${escapeHtml(rootName)}">${escapeHtml(rootName)}</span>
       <span class="root-badge">根目录</span>
     `;
     rootItem.addEventListener('click', (e) => {
@@ -444,17 +652,19 @@ const FolderTree = {
       e.stopPropagation();
       this.showContextMenu(e.clientX, e.clientY, dirPath, true);
     });
+    this.applyItemAccessibility(rootItem, rootName);
+    rootItem.setAttribute('aria-level', '1');
 
     this.setupDropZone(rootItem);
     rootWrapper.appendChild(rootItem);
     this.container.appendChild(rootWrapper);
-    this.setupContainerDropZone();
     
     this.previewFolder(dirPath, rootItem);
     
     const folders = await window.api.getSubfolders(dirPath);
     
     if (folders.length === 0) {
+      this.syncTreeRovingTabIndex(0);
       return;
     }
 
@@ -462,10 +672,11 @@ const FolderTree = {
       const item = await this.createFolderItem(dirPath, folder);
       rootWrapper.appendChild(item);
     }
+    this.syncTreeRovingTabIndex(0);
   },
 
   async createFolderItem(parentPath, folderName) {
-    const fullPath = `${parentPath}\\${folderName}`;
+    const fullPath = joinPath(parentPath, folderName);
     const wrapper = document.createElement('div');
     wrapper.className = 'folder-wrapper';
 
@@ -473,6 +684,7 @@ const FolderTree = {
     item.className = 'folder-item';
     item.dataset.path = fullPath;
     item.dataset.childrenLoaded = 'false';
+    this.applyItemAccessibility(item, folderName);
 
     const expandIcon = `
       <svg class="expand-icon" viewBox="0 0 24 24" fill="currentColor">
@@ -480,7 +692,7 @@ const FolderTree = {
       </svg>
     `;
 
-    item.innerHTML = `${expandIcon}<span class="folder-name" title="${folderName}">${folderName}</span>`;
+    item.innerHTML = `${expandIcon}<span class="folder-name" title="${escapeHtml(folderName)}">${escapeHtml(folderName)}</span>`;
     item.addEventListener('click', (event) => {
       event.stopPropagation();
       this.handleFolderClick(event, item.dataset.path, item);
@@ -514,6 +726,7 @@ const FolderTree = {
     if (!willExpand) {
       subList.classList.remove('expanded');
       expandIconEl.classList.remove('expanded');
+      item.setAttribute('aria-expanded', 'false');
       return;
     }
 
@@ -527,6 +740,10 @@ const FolderTree = {
       subList.dataset.loaded = 'true';
       delete subList.dataset.loading;
       if (folders.length === 0) expandIconEl.style.visibility = 'hidden';
+      // 只有确认过子目录数量才写 aria-expanded，否则读屏会说"可展开"却展不开
+      if (folders.length > 0) item.setAttribute('aria-expanded', 'true');
+    } else {
+      item.setAttribute('aria-expanded', 'true');
     }
 
     subList.classList.add('expanded');
@@ -536,8 +753,11 @@ const FolderTree = {
   previewFolder(path, element) {
     document.querySelectorAll('.folder-item.active').forEach(el => {
       el.classList.remove('active');
+      el.removeAttribute('aria-current');
     });
     element.classList.add('active');
+    element.setAttribute('aria-current', 'true');
+    this._treeIndex = this._getVisibleFolderIndex(element);
     
     if (this.onFolderPreview) {
       this.onFolderPreview(path);
@@ -571,83 +791,33 @@ const FolderTree = {
     });
   },
 
+  // 容器空白处的放置目标 = 根目录。
+  // 旧实现用 `e.target !== this.container` 当守卫，但容器里几乎铺满了 .folder-wrapper，
+  // 事件目标永远不是容器本身，于是"拖到空白处移到根目录"实际上从未生效。
   setupContainerDropZone() {
+    const isItemTarget = (e) => Boolean(e.target.closest && e.target.closest('.folder-item'));
+
     this.container.addEventListener('dragover', (e) => {
-      if (e.target !== this.container) return;
+      if (isItemTarget(e)) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = 'move';
       this.container.classList.add('drag-over');
     });
 
     this.container.addEventListener('dragleave', (e) => {
-      if (e.target === this.container) {
+      if (!this.container.contains(e.relatedTarget)) {
         this.container.classList.remove('drag-over');
       }
     });
 
     this.container.addEventListener('drop', async (e) => {
-      if (e.target !== this.container) return;
+      if (isItemTarget(e)) return;
       e.preventDefault();
       this.container.classList.remove('drag-over');
       const destDir = this.rootPath;
       if (!destDir) return;
 
-      const folderPath = e.dataTransfer.getData('application/x-folder-path');
-      if (folderPath) {
-        if (folderPath === destDir) return;
-        if (destDir.startsWith(folderPath + '\\') || destDir === folderPath) return;
-        App.fileOperationPending = true;
-        const result = await window.api.moveFolder(folderPath, destDir);
-        if (result.success) {
-          await this.reloadTree();
-          this.expandFolder(destDir);
-          if (App.currentPath === folderPath || App.currentPreviewPath === folderPath) {
-            App.currentPath = result.newPath;
-            App.currentPreviewPath = result.newPath;
-            document.getElementById('directory-path').textContent = result.newPath;
-          }
-        } else {
-          App.fileOperationPending = false;
-        }
-        App._lastOpTime = Date.now();
-        return;
-      }
-
-      const batchPaths = e.dataTransfer.getData('application/x-file-paths');
-      if (batchPaths) {
-        const paths = JSON.parse(batchPaths);
-        App.fileOperationPending = true;
-        let successCount = 0;
-        for (const filePath of paths) {
-          if (filePath === destDir) continue;
-          const result = await window.api.moveFile(filePath, destDir);
-          if (result.success) successCount++;
-        }
-        if (successCount > 0) {
-          Waterfall.removeCards(paths);
-          if (destDir === App.currentPreviewPath) {
-            await Waterfall.loadImages(destDir);
-          }
-        }
-        App._lastOpTime = Date.now();
-        App.fileOperationPending = false;
-        return;
-      }
-
-      const filePath = e.dataTransfer.getData('text/plain');
-      if (!filePath) return;
-      if (filePath === destDir) return;
-
-      App.fileOperationPending = true;
-      const result = await window.api.moveFile(filePath, destDir);
-      if (result.success) {
-        Waterfall.removeCards([filePath]);
-        if (destDir === App.currentPreviewPath) {
-          await Waterfall.loadImages(destDir);
-        }
-      }
-      App._lastOpTime = Date.now();
-      App.fileOperationPending = false;
+      await this.handleDropOnFolder(destDir, e.dataTransfer);
     });
   },
 
@@ -666,66 +836,86 @@ const FolderTree = {
 
     element.addEventListener('drop', async (e) => {
       e.preventDefault();
+      // 不冒泡到容器，否则同一次 drop 会被当成"移到根目录"再执行一遍
+      e.stopPropagation();
       element.classList.remove('drag-over');
       const destDir = element.dataset.path;
       if (!destDir) return;
 
-      const folderPath = e.dataTransfer.getData('application/x-folder-path');
-      if (folderPath) {
-        if (folderPath === destDir) return;
-        if (destDir.startsWith(folderPath + '\\') || destDir === folderPath) return;
-        App.fileOperationPending = true;
-        const result = await window.api.moveFolder(folderPath, destDir);
-        if (result.success) {
-          await this.reloadTree();
-          this.expandFolder(destDir);
-          if (App.currentPath === folderPath || App.currentPreviewPath === folderPath) {
-            App.currentPath = result.newPath;
-            App.currentPreviewPath = result.newPath;
-            document.getElementById('directory-path').textContent = result.newPath;
-          }
-        } else {
-          App.fileOperationPending = false;
-        }
-        App._lastOpTime = Date.now();
-        return;
-      }
+      await this.handleDropOnFolder(destDir, e.dataTransfer);
+    });
+  },
 
-      const batchPaths = e.dataTransfer.getData('application/x-file-paths');
-      if (batchPaths) {
-        const paths = JSON.parse(batchPaths);
-        App.fileOperationPending = true;
-        let successCount = 0;
-        for (const filePath of paths) {
-          if (filePath === destDir) continue;
-          const result = await window.api.moveFile(filePath, destDir);
-          if (result.success) successCount++;
-        }
-        if (successCount > 0) {
-          Waterfall.removeCards(paths);
-          if (destDir === App.currentPreviewPath) {
-            await Waterfall.loadImages(destDir);
-          }
-        }
-        App._lastOpTime = Date.now();
-        App.fileOperationPending = false;
-        return;
-      }
+  _basename(targetPath) {
+    return baseName(targetPath);
+  },
 
-      const filePath = e.dataTransfer.getData('text/plain');
-      if (!filePath) return;
-      if (filePath === destDir) return;
-
+  /**
+   * 把拖拽内容移动到 destDir。
+   * 原先「文件夹条目」和「树空白处」各有一份约 100 行的重复实现，
+   * 两份都已经漂移，这里合成唯一一份。
+   */
+  async handleDropOnFolder(destDir, dataTransfer) {
+    const folderPath = dataTransfer.getData('application/x-folder-path');
+    if (folderPath) {
+      if (folderPath === destDir) return;
+      if (destDir.startsWith(folderPath + '\\') || destDir === folderPath) return;
       App.fileOperationPending = true;
-      const result = await window.api.moveFile(filePath, destDir);
+      const result = await window.api.moveFolder(folderPath, destDir);
       if (result.success) {
-        Waterfall.removeCards([filePath]);
-        if (destDir === App.currentPreviewPath) {
-          await Waterfall.loadImages(destDir);
+        await this.reloadTree();
+        this.expandFolder(destDir);
+        Toast.success(`已移动「${this._basename(folderPath)}」到「${this._basename(destDir)}」`);
+        if (App.currentPath === folderPath || App.currentPreviewPath === folderPath) {
+          App.currentPath = result.newPath;
+          App.currentPreviewPath = result.newPath;
+          document.getElementById('directory-path').textContent = result.newPath;
         }
+      } else {
+        App.fileOperationPending = false;
+        Toast.error(result.error || '移动文件夹失败');
       }
       App._lastOpTime = Date.now();
-      App.fileOperationPending = false;
-    });
+      return;
+    }
+
+    const batchRaw = dataTransfer.getData('application/x-file-paths');
+    const single = dataTransfer.getData('text/plain');
+    let paths = [];
+    if (batchRaw) {
+      try {
+        paths = JSON.parse(batchRaw);
+      } catch (_) {
+        paths = [];
+      }
+    } else if (single) {
+      paths = [single];
+    }
+    if (!Array.isArray(paths) || paths.length === 0) return;
+
+    App.fileOperationPending = true;
+    const result = await window.api.moveFiles(paths, destDir);
+    const movedPaths = (result && result.movedPaths) || [];
+
+    if (movedPaths.length > 0) {
+      // 只移除真的移动成功的卡片，失败的要留在原处
+      Waterfall.removeCards(movedPaths);
+      if (destDir === App.currentPreviewPath) {
+        await Waterfall.loadImages(destDir);
+      }
+      Toast.success(`已移动 ${movedPaths.length} 个文件到「${this._basename(destDir)}」`);
+    }
+    if (result && result.error) {
+      Toast.error(`${paths.length - movedPaths.length} 个文件未能移动：\n${result.error}`);
+    }
+    App._lastOpTime = Date.now();
+    App.fileOperationPending = false;
   }
 };
+
+// 这几个是纯函数，但一个管目录名转义（防注入）、一个管路径拼接（反斜杠硬编码的替代），
+// 都属于"错了会静默出事"的类型，导出给 node --test 直接覆盖。
+// 浏览器里没有 module，typeof 守卫不会误伤。
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = { escapeHtml, baseName, joinPath, dirName };
+}

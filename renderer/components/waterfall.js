@@ -37,6 +37,9 @@ const Waterfall = {
 
   selectedPaths: new Set(),
   lastClickedIndex: -1,
+  // roving tabindex 记的是"当前卡片"在网格里的位置，重排/增删后靠它把焦点落回原处。
+  _keyboardIndex: -1,
+  _gridHadFocus: false,
   _isSelecting: false,
   _selectBox: null,
   _selectStartX: 0,
@@ -48,13 +51,207 @@ const Waterfall = {
     this.grid = document.getElementById(gridId);
     this.container = document.getElementById(containerId);
     this._zoomIndicator = document.getElementById('zoom-indicator');
+    // 网格用 listbox/option + roving tabindex：Tab 只能进入"当前卡片"一张，
+    // 卡片之间用方向键走（见 handleGridKeydown）。若每张卡片都 tabindex="0"，
+    // 一个千张图的目录会变成按一千次 Tab 才能穿过去。
+    if (this.grid) {
+      this.grid.setAttribute('role', 'listbox');
+      this.grid.setAttribute('aria-multiselectable', 'true');
+      this.grid.setAttribute('aria-label', '媒体文件');
+    }
     this.loadZoom();
     this.setupZoom();
     this.setupSelection();
+    this.setupKeyboard();
     this.setupScrollPerformance();
     this.setupFilterControls();
     this.setupMetadataListeners();
     this.setupThumbnailObserver();
+  },
+
+  // ---------- 键盘可达性 ----------
+  // 卡片本来是裸 div，Tab 根本进不来（审计实测 7/7 不可聚焦）。
+  // 这里给它们 listbox/option 语义 + roving tabindex。
+  applyCardAccessibility(card, imageInfo) {
+    card.setAttribute('role', 'option');
+    card.setAttribute('aria-selected', 'false');
+    card.tabIndex = -1;
+    const label = imageInfo.relativePath || imageInfo.name || this.getBasename(imageInfo.path);
+    card.setAttribute('aria-label', label);
+  },
+
+  setupKeyboard() {
+    if (!this.grid) return;
+    this.grid.addEventListener('keydown', (event) => this.handleGridKeydown(event));
+    this.syncRovingTabIndex(0);
+  },
+
+  cards() {
+    if (!this.grid) return [];
+    return Array.from(this.grid.querySelectorAll('.image-card'));
+  },
+
+  focusedCard() {
+    const active = document.activeElement;
+    if (active && active.classList && active.classList.contains('image-card')) return active;
+    return null;
+  },
+
+  // 整个网格只留一张 tabindex="0" 的卡片：Tab 进入网格 = 回到上次停留的那张，
+  // 而不是从第一张开始重新按一遍。
+  syncRovingTabIndex(preferredIndex) {
+    const cards = this.cards();
+    if (cards.length === 0) {
+      this._keyboardIndex = -1;
+      return;
+    }
+    let index;
+    if (typeof preferredIndex === 'number' && preferredIndex >= 0) {
+      index = GridNav.clampIndex(preferredIndex, cards.length);
+    } else if (this._keyboardIndex >= 0) {
+      index = GridNav.clampIndex(this._keyboardIndex, cards.length);
+    } else {
+      index = 0;
+    }
+    cards.forEach((card, position) => { card.tabIndex = position === index ? 0 : -1; });
+    this._keyboardIndex = index;
+  },
+
+  focusCardAt(index, options = {}) {
+    const cards = this.cards();
+    if (cards.length === 0) return null;
+    const safeIndex = GridNav.clampIndex(index, cards.length);
+    const card = cards[safeIndex];
+    this.syncRovingTabIndex(safeIndex);
+    card.focus({ preventScroll: true });
+    if (options.scrollIntoView !== false) {
+      card.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+    return card;
+  },
+
+  /**
+   * 量所有卡片的几何位置。卡片是 content-visibility:auto，屏外未渲染的卡片
+   * getBoundingClientRect() 只会返回 contain-intrinsic-size 的占位高度，
+   * 拿它算"下一行"会跳到错误的卡片上。这里临时关掉跳过布局，量完立刻恢复。
+   * 只在按键时发生，不进滚动路径。
+   */
+  measureCardRects(cards) {
+    this.grid.classList.add('measuring-geometry');
+    const rects = cards.map((card) => card.getBoundingClientRect());
+    this.grid.classList.remove('measuring-geometry');
+    return rects;
+  },
+
+  handleGridKeydown(event) {
+    if (event.defaultPrevented) return;
+    if (event.target.closest('input, textarea')) return;
+    // 灯箱开着时方向键归预览用（缩放、翻页），网格快捷键一律让位
+    if (Preview.isOpen) return;
+
+    const cards = this.cards();
+    if (cards.length === 0) return;
+    const current = this.focusedCard();
+    const currentIndex = current ? cards.indexOf(current) : this._keyboardIndex;
+
+    const direction = GridNav.directionOfKey(event.key);
+    if (direction) {
+      event.preventDefault();
+      if (currentIndex < 0) {
+        this.focusCardAt(0);
+        return;
+      }
+      const rects = this.measureCardRects(cards);
+      const nextIndex = GridNav.pickNeighbor(rects, currentIndex, direction);
+      this.focusCardAt(nextIndex < 0 ? currentIndex : nextIndex);
+      return;
+    }
+
+    switch (event.key) {
+      case 'Home':
+        event.preventDefault();
+        this.focusCardAt(0);
+        break;
+      case 'End':
+        event.preventDefault();
+        this.focusCardAt(cards.length - 1);
+        break;
+      case 'Enter':
+        event.preventDefault();
+        this.openFocusedCard();
+        break;
+      case ' ':
+      case 'Spacebar':
+        event.preventDefault();
+        this.toggleFocusedSelection();
+        break;
+      case 'F2':
+        event.preventDefault();
+        this.renameFocusedCard();
+        break;
+      case 'Delete':
+        event.preventDefault();
+        this.deleteFocusedCard();
+        break;
+      case 'Escape':
+        if (this.selectedPaths.size > 0) {
+          event.preventDefault();
+          this.clearSelection();
+          this.updateStats();
+        }
+        break;
+      default:
+        break;
+    }
+  },
+
+  openFocusedCard() {
+    const card = this.focusedCard();
+    if (!card) return;
+    const index = this.imageList.findIndex((item) => item.path === card.dataset.path);
+    if (index === -1) return;
+    Preview.open(this.imageList, index);
+  },
+
+  toggleFocusedSelection() {
+    const card = this.focusedCard();
+    if (!card) return;
+    const path = card.dataset.path;
+    if (!path) return;
+    const selected = !this.selectedPaths.has(path);
+    if (selected) this.selectedPaths.add(path);
+    else this.selectedPaths.delete(path);
+    card.classList.toggle('selected', selected);
+    card.setAttribute('aria-selected', selected ? 'true' : 'false');
+    this._keyboardIndex = this.cards().indexOf(card);
+    this.lastClickedIndex = this._keyboardIndex;
+    this.updateStats();
+  },
+
+  renameFocusedCard() {
+    const card = this.focusedCard();
+    if (!card) return;
+    const imageInfo = this._cardImageMap.get(card);
+    if (!imageInfo) return;
+    // 与右键菜单同一道门槛：内联重命名需要卡片上有 .image-filename，只有文件名布局有
+    if (SettingsManager.getSortMode() !== 'filename') {
+      Toast.info('内联重命名只在「文件名」布局下可用');
+      return;
+    }
+    this.startRenameCard(imageInfo);
+  },
+
+  async deleteFocusedCard() {
+    const card = this.focusedCard();
+    if (!card) return;
+    const path = card.dataset.path;
+    if (!path) return;
+    // 焦点卡片在多选集合里就删整批，否则只删这一张 —— 与右键菜单的语义一致
+    const images = this.selectedPaths.has(path) && this.selectedPaths.size > 1
+      ? this.getSelectedImages()
+      : this.imageList.filter((item) => item.path === path);
+    if (images.length === 0) return;
+    await ContextMenu.deleteImages(images);
   },
 
   getBasename(filePath) {
@@ -292,14 +489,20 @@ const Waterfall = {
 
   selectAllFiltered() {
     this.selectedPaths = new Set(this.imageList.map((item) => item.path));
-    this.grid.querySelectorAll('.image-card').forEach((card) => card.classList.add('selected'));
+    this.grid.querySelectorAll('.image-card').forEach((card) => {
+      card.classList.add('selected');
+      card.setAttribute('aria-selected', 'true');
+    });
     this.updateStats();
   },
 
   clearSelection() {
     this.selectedPaths.clear();
     this.lastClickedIndex = -1;
-    this.grid.querySelectorAll('.image-card.selected').forEach((card) => card.classList.remove('selected'));
+    this.grid.querySelectorAll('.image-card.selected').forEach((card) => {
+      card.classList.remove('selected');
+      card.setAttribute('aria-selected', 'false');
+    });
     this.updateStats();
   },
 
@@ -340,6 +543,9 @@ const Waterfall = {
       card.classList.add('selected');
       this.lastClickedIndex = domIndex;
     }
+    // 鼠标选中的那张同时成为 Tab 的落点，键盘接着用不会跳回第一张
+    this._keyboardIndex = domIndex;
+    this.syncRovingTabIndex(domIndex);
     this.updateStats();
   },
 
@@ -508,6 +714,12 @@ const Waterfall = {
   rebuildView({ resetScroll = false, preserveScroll = false, minimumCards = 0 } = {}) {
     const previousScroll = preserveScroll ? this.container.scrollTop : 0;
     const previousCards = preserveScroll ? this.grid.querySelectorAll('.image-card').length : minimumCards;
+    const active = document.activeElement;
+    this._gridHadFocus = Boolean(active && this.grid.contains(active));
+    if (this._gridHadFocus) {
+      const domIndex = this.cards().indexOf(this.focusedCard());
+      if (domIndex >= 0) this._keyboardIndex = domIndex;
+    }
     this.disconnectRenderObservers();
     this.grid.innerHTML = '';
     this._renderPlan = this.buildRenderPlan(this.imageList);
@@ -516,6 +728,11 @@ const Waterfall = {
     this.applyZoom();
     if (preserveScroll) this.container.scrollTop = previousScroll;
     if (resetScroll) this.container.scrollTop = 0;
+    // 卡片全被重建过，roving tabindex 也要重新分配；重建后焦点通常已掉到 body，
+    // 这时把焦点收回原位置的卡片，键盘用户不会"按一下方向键就不知道自己在哪"。
+    const hadFocus = this._gridHadFocus;
+    this.syncRovingTabIndex(this._keyboardIndex);
+    if (hadFocus) this.focusCardAt(this._keyboardIndex);
     this.updateStats();
   },
 
@@ -569,6 +786,9 @@ const Waterfall = {
         const header = document.createElement('div');
         header.className = 'date-header';
         header.textContent = entry.text;
+        // 容器是 role="listbox"，非 option 的子节点要让读屏跳过，
+        // 否则日期分组标题会被当成"列表项"念出来。
+        header.setAttribute('role', 'presentation');
         fragment.appendChild(header);
       } else {
         const index = this._imageIndexMap ? (this._imageIndexMap.get(entry.item.path) ?? -1) : -1;
@@ -588,10 +808,13 @@ const Waterfall = {
     if (this._renderIndex < this._renderPlan.length) {
       this._loadMoreSentinel = document.createElement('div');
       this._loadMoreSentinel.className = 'load-more-sentinel';
+      this._loadMoreSentinel.setAttribute('role', 'presentation');
       this._loadMoreSentinel.textContent = '继续加载...';
       this.grid.appendChild(this._loadMoreSentinel);
       this.observeLoadMore();
     }
+    // 新批次里可能还没有任何 tabindex="0" 的卡片（首批渲染、或原来那张被删除）
+    this.syncRovingTabIndex();
     this.updateStats();
   },
 
@@ -703,6 +926,7 @@ const Waterfall = {
     const card = document.createElement('div');
     card.className = imageInfo.type === 'video' ? 'image-card filename-card video-card' : 'image-card filename-card';
     card.dataset.path = imageInfo.path;
+    this.applyCardAccessibility(card, imageInfo);
     const name = this.createFilenameElement(imageInfo);
     card.appendChild(name);
     if (imageInfo.type === 'video') {
@@ -719,6 +943,7 @@ const Waterfall = {
     const card = document.createElement('div');
     card.className = imageInfo.type === 'video' ? 'image-card video-card' : 'image-card';
     card.dataset.path = imageInfo.path;
+    this.applyCardAccessibility(card, imageInfo);
     if (imageInfo.type === 'video') {
       card.appendChild(this.createVideoElement(imageInfo));
     } else {
@@ -914,6 +1139,8 @@ const Waterfall = {
           this._imageIndexMap = new Map(this.imageList.map((item, index) => [item.path, index]));
         } else {
           App.fileOperationPending = false;
+          // 重命名成已存在的名字是最常见的失败，必须说出来而不是静默还原
+          Toast.error(result.error || '重命名失败');
         }
       }
       const restored = document.createElement('div');

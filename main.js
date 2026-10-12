@@ -77,6 +77,16 @@ function createWindow() {
     stopWatching();
     saveWindowState();
   });
+
+  // 无边框窗口里最大化按钮是唯一的状态提示：不把状态推给渲染层，
+  // 按钮会永远显示"最大化"图标，用户双击标题栏后就看不出当前是不是最大化。
+  const pushMaximizedState = () => {
+    if (!win || win.isDestroyed()) return;
+    win.webContents.send('window-maximized-changed', win.isMaximized());
+  };
+  win.on('maximize', pushMaximizedState);
+  win.on('unmaximize', pushMaximizedState);
+  win.on('ready-to-show', pushMaximizedState);
 }
 
 /**
@@ -158,10 +168,10 @@ ipcMain.handle('get-subfolders', async (event, dirPath) => {
   }
 });
 
-ipcMain.handle('select-directory', async () => {
+ipcMain.handle('select-directory', async (event, title) => {
   const result = await dialog.showOpenDialog(win, {
     properties: ['openDirectory'],
-    title: '选择媒体目录'
+    title: (typeof title === 'string' && title) ? title : '选择媒体目录'
   });
   return result.canceled ? null : { path: result.filePaths[0] };
 });
@@ -179,6 +189,56 @@ ipcMain.handle('copy-file-path', async (event, filePath) => {
 ipcMain.handle('show-file-in-explorer', async (event, filePath) => {
   shell.showItemInFolder(filePath);
   return { success: true };
+});
+
+// 「用默认程序打开」：交给系统关联程序，Mediew 自身不解码这些格式也没关系。
+ipcMain.handle('open-file', async (event, filePath) => {
+  try {
+    // shell.openPath 用返回值表达失败（成功时是空串），不抛异常
+    const message = await shell.openPath(filePath);
+    if (message) return { success: false, error: message };
+    return { success: true };
+  } catch (error) {
+    return { success: false, error: error.message };
+  }
+});
+
+// 批量移动：右键菜单的「移动到…」入口，不必再靠拖拽才能移动文件。
+// 逐个移动而不是整体失败，部分成功时也要把已移动的路径回传给渲染层。
+ipcMain.handle('move-files', async (event, filePaths, destDir) => {
+  const paths = Array.isArray(filePaths) ? filePaths : [];
+  if (!destDir || paths.length === 0) return { success: false, error: '没有可移动的文件' };
+
+  const movedPaths = [];
+  const failures = [];
+  for (const filePath of paths) {
+    const destPath = path.join(destDir, path.basename(filePath));
+    if (filePath === destPath) {
+      failures.push(`${path.basename(filePath)}：已在该文件夹中`);
+      continue;
+    }
+    try {
+      await fsp.access(destPath);
+      failures.push(`${path.basename(filePath)}：目标文件夹已存在同名文件`);
+      continue;
+    } catch (_) {}
+    try {
+      await fsp.rename(filePath, destPath);
+      movedPaths.push(destPath);
+    } catch (error) {
+      failures.push(`${path.basename(filePath)}：${error.message}`);
+    }
+  }
+
+  if (movedPaths.length === 0) {
+    return { success: false, error: failures[0] || '没有文件被移动' };
+  }
+  return {
+    success: true,
+    movedPaths,
+    failedCount: failures.length,
+    error: failures.length ? failures.join('\n') : undefined
+  };
 });
 
 // 目录监听仍采用 fs.watch，但将刷新消息合并到更短的 800ms 窗口。
@@ -216,6 +276,16 @@ ipcMain.on('watch-directory', (event, dirPath) => startWatching(dirPath));
 ipcMain.on('unwatch-directory', () => stopWatching());
 
 // 文件操作统一使用异步 fs，避免大目录或网络盘操作造成主进程假死。
+
+// 批量确认框只列出前几个名字：几十个文件全铺进 detail 会把对话框撑到屏幕外，
+// 反而看不清到底要删什么。
+const DIALOG_NAME_LIMIT = 8;
+function describeNames(names, total) {
+  const list = names.slice(0, DIALOG_NAME_LIMIT);
+  if (total > list.length) list.push(`…等 ${total} 个`);
+  return list.join('\n');
+}
+
 ipcMain.handle('delete-file', async (event, filePath) => {
   const result = await dialog.showMessageBox(win, {
     type: 'warning',
@@ -242,7 +312,7 @@ ipcMain.handle('delete-files', async (event, filePaths) => {
     defaultId: 1,
     title: '确认删除',
     message: `确定要删除这 ${paths.length} 个文件吗？`,
-    detail: paths.map((item) => path.basename(item)).join('\n')
+    detail: describeNames(paths.map((item) => path.basename(item)), paths.length)
   });
   if (result.response !== 0) return { success: false };
 
@@ -328,7 +398,7 @@ ipcMain.handle('delete-folders', async (event, dirPaths) => {
     defaultId: 1,
     title: '确认删除文件夹',
     message: `确定要删除这 ${paths.length} 个文件夹吗？`,
-    detail: `${paths.map((item) => path.basename(item)).join('\n')}\n\n文件夹内的所有内容都将被删除。`
+    detail: `${describeNames(paths.map((item) => path.basename(item)), paths.length)}\n\n文件夹内的所有内容都将被删除。`
   });
   if (result.response !== 0) return { success: false };
   if (watchedPath && paths.some((dirPath) => watchedPath === dirPath || watchedPath.startsWith(`${dirPath}${path.sep}`))) {
@@ -386,6 +456,7 @@ ipcMain.on('window-maximize', () => {
   win.isMaximized() ? win.unmaximize() : win.maximize();
 });
 ipcMain.on('window-close', () => win && win.close());
+ipcMain.handle('is-window-maximized', () => Boolean(win && !win.isDestroyed() && win.isMaximized()));
 
 app.whenReady().then(async () => {
   mediaService = new MediaService({ userDataPath: app.getPath('userData') });

@@ -83,6 +83,11 @@
         </button>
         <div class="preview-image-container">
           <img id="preview-image" src="" alt="">
+          <div id="preview-loading" class="preview-loading" role="status" aria-live="polite">
+            <span class="preview-spinner" aria-hidden="true"></span>
+            <span id="preview-loading-text">正在加载…</span>
+          </div>
+          <div id="preview-zoom-indicator" class="preview-zoom-indicator" role="presentation"></div>
           <video id="preview-video" style="display: none;"></video>
           <div id="video-controls" class="video-controls">
             <button id="video-play" class="video-play-btn" title="播放/暂停">
@@ -238,25 +243,32 @@
     </div>
   </div>
 
-  <div id="context-menu" class="context-menu hidden">
-    <div class="context-menu-item" data-action="favorite">收藏</div>
-    <div class="context-menu-item" data-action="copy-path">复制完整路径</div>
-    <div class="context-menu-item" data-action="show-in-explorer">在资源管理器中显示</div>
-    <div class="context-menu-item" data-action="rename">重命名</div>
-    <div class="context-menu-item" data-action="delete">删除</div>
+  <div id="context-menu" class="context-menu hidden" role="menu" aria-label="文件操作">
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="open-with-default">用默认程序打开</div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="favorite">收藏</div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="rename">重命名</div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="move-to">移动到…</div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="copy-path">复制完整路径</div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="show-in-explorer">在资源管理器中显示</div>
+    <div class="context-menu-separator" role="separator"></div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="delete">删除</div>
   </div>
 
-  <div id="folder-context-menu" class="context-menu hidden">
-    <div class="context-menu-item" data-action="new-folder">新建文件夹</div>
-    <div class="context-menu-item" data-action="rename">重命名</div>
-    <div class="context-menu-item" data-action="delete">删除文件夹</div>
-    <div class="context-menu-item" data-action="open-in-explorer">在资源管理器中打开</div>
+  <div id="folder-context-menu" class="context-menu hidden" role="menu" aria-label="文件夹操作">
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="new-folder">新建文件夹</div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="rename">重命名</div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="open-in-explorer">在资源管理器中打开</div>
+    <div class="context-menu-separator" role="separator"></div>
+    <div class="context-menu-item" role="menuitem" tabindex="-1" data-action="delete">删除文件夹</div>
   </div>
 
   <div id="zoom-indicator"></div>
+  <div id="toast-host" aria-live="polite" aria-atomic="false"></div>
 
   <script src="utils/date-formatter.js"></script>
+  <script src="utils/grid-nav.js"></script>
   <script src="components/titlebar.js"></script>
+  <script src="components/toast.js"></script>
   <script src="components/folder-tree.js"></script>
   <script src="components/waterfall.js"></script>
   <script src="components/preview.js"></script>

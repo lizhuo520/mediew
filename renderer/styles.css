@@ -3,8 +3,15 @@
   --bg-secondary: #192734;
   --bg-card: #1e2d3d;
   --text-primary: #e7e9ea;
-  --text-secondary: #71767b;
-  --text-tertiary: #536471;
+  /* 次级/三级文字都按 WCAG AA 正文 4.5:1 反推，并且要求在三种深色底
+     （bg-primary / bg-secondary / bg-card）上都达标 —— 三级文字会出现在
+     卡片内、日期分组标题、统计栏、加载提示等多个位置。
+     原 #71767b(3.59:1) 与 #536471(2.69:1) 明显偏暗，读不清。
+     层级现在靠字号与字重区分，而不是靠"更暗"：
+     text-primary #e7e9ea > text-secondary #9aa5b1 > text-tertiary #8b98a5。
+     test/theme-contrast.test.js 会把这三个值锁住。 */
+  --text-secondary: #9aa5b1;
+  --text-tertiary: #8b98a5;
   --accent-blue: #1d9bf0;
   --accent-blue-hover: #1a8cd8;
   --border-color: #2f3336;
@@ -15,6 +22,9 @@
   --preview-counter-bg: rgba(0, 0, 0, 0.6);
   --nav-btn-bg: rgba(255, 255, 255, 0.1);
   --nav-btn-hover: rgba(255, 255, 255, 0.25);
+  /* 危险色要当文字用（右键菜单的"删除"、Toast 的左侧色条），
+     所以也按 AA 4.5:1 反推：#f4212e 在三种深色底上只有 3.4~4.0:1。 */
+  --danger: #ff5c69;
 }
 
 :root[data-theme="light"] {
@@ -23,7 +33,8 @@
   --bg-card: #eff3f4;
   --text-primary: #0f1419;
   --text-secondary: #536471;
-  --text-tertiary: #71767b;
+  /* 原 #71767b 只有 4.34:1，略低于 AA，这里加深到 5.45:1。 */
+  --text-tertiary: #5f6b75;
   --accent-blue: #1d9bf0;
   --accent-blue-hover: #1a8cd8;
   --border-color: #eff3f4;
@@ -34,6 +45,8 @@
   --preview-counter-bg: rgba(0, 0, 0, 0.75);
   --nav-btn-bg: rgba(255, 255, 255, 0.15);
   --nav-btn-hover: rgba(255, 255, 255, 0.3);
+  /* 浅色底下 #d61c2b 在三种底色上是 4.6~5.2:1，无需再调。 */
+  --danger: #d61c2b;
 }
 
 * {
@@ -208,16 +221,25 @@ body {
   background: var(--hover-bg);
 }
 
+/* 选中态不再用强调色当正文色：
+   #1d9bf0 在浅色底上只有 2.84:1，而"当前正在浏览的文件夹"恰恰是最需要看清的标签。
+   改为保持 text-primary + 左侧色条 + 底色，靠形状而非色相表达选中。 */
 .folder-item.active {
   background: rgba(29, 155, 240, 0.1);
-  color: var(--accent-blue);
+  color: var(--text-primary);
+  font-weight: 600;
+  box-shadow: inset 3px 0 0 var(--accent-blue);
 }
 
 .folder-item.selected {
   background: rgba(29, 155, 240, 0.15);
-  color: var(--accent-blue);
+  color: var(--text-primary);
   outline: 1px solid var(--accent-blue);
   outline-offset: -1px;
+}
+
+.folder-item.selected .folder-name {
+  font-weight: 600;
 }
 
 #folder-list {
@@ -262,7 +284,7 @@ body {
 
 .folder-item.root-folder.active {
   background: rgba(29, 155, 240, 0.15);
-  color: var(--accent-blue);
+  color: var(--text-primary);
 }
 
 /* Root badge */
@@ -427,6 +449,8 @@ body {
   justify-content: center;
   overflow: hidden;
   cursor: grab;
+  /* 加载骨架和缩放提示都定位在这一层里 */
+  position: relative;
 }
 
 .preview-image-container.dragging {
@@ -1019,16 +1043,31 @@ body {
   transition: background 0.1s;
 }
 
-.context-menu-item:hover {
+.context-menu-item:hover,
+.context-menu-item:focus-visible {
   background: var(--hover-bg);
 }
 
-.context-menu-item[data-action="delete"] {
-  color: #f4212e;
+/* 菜单项用 tabindex=-1 自己管理焦点（见 context-menu.js 的方向键导航），
+   所以焦点态必须显式画出来，不能依赖浏览器默认 outline。 */
+.context-menu-item:focus-visible {
+  outline: none;
+  box-shadow: inset 2px 0 0 var(--accent-blue);
 }
 
-.context-menu-item[data-action="delete"]:hover {
-  background: rgba(244, 33, 46, 0.1);
+.context-menu-item[data-action="delete"] {
+  color: var(--danger);
+}
+
+.context-menu-item[data-action="delete"]:hover,
+.context-menu-item[data-action="delete"]:focus-visible {
+  background: rgba(244, 33, 46, 0.12);
+}
+
+.context-menu-separator {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border-color);
 }
 
 /* Drag & Drop */
@@ -1055,6 +1094,19 @@ body {
 
 .image-card.selected:hover {
   outline-color: var(--accent-blue-hover);
+}
+
+/* 键盘焦点。卡片本身有 selected 描边、文件夹项有 active/selected 底色，
+   焦点环得和它们能同时看清，所以统一用 accent 描边 + 偏移量区分。 */
+.image-card:focus-visible,
+.folder-item:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
+.folder-item:focus-visible {
+  /* 树是窄栏，焦点环往内收才不会被相邻项裁掉 */
+  outline-offset: -2px;
 }
 
 .selection-box {
@@ -1274,6 +1326,62 @@ body {
   opacity: 1;
 }
 
+/* 灯箱里生成 4096 预览要几秒，图像区得有东西告诉用户"还在转"，不能只靠右侧一行小字。 */
+.preview-loading {
+  position: absolute;
+  inset: 0;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  color: rgba(255, 255, 255, 0.86);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.preview-loading.visible {
+  display: flex;
+}
+
+.preview-spinner {
+  width: 28px;
+  height: 28px;
+  border: 2px solid rgba(255, 255, 255, 0.22);
+  border-top-color: var(--accent-blue);
+  border-radius: 50%;
+  animation: preview-spin 0.8s linear infinite;
+}
+
+@keyframes preview-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .preview-spinner { animation-duration: 0s; }
+}
+
+/* 灯箱的缩放同样没有数值反馈：网格有 #zoom-indicator，预览里一直只有画面在变。 */
+.preview-zoom-indicator {
+  position: absolute;
+  bottom: 20px;
+  right: 20px;
+  background: rgba(0, 0, 0, 0.75);
+  color: white;
+  padding: 6px 14px;
+  border-radius: 16px;
+  font-size: 13px;
+  font-weight: 500;
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+  z-index: 30;
+}
+
+.preview-zoom-indicator.visible {
+  opacity: 1;
+}
+
 /* ===== 性能与 RAW 界面增强 ===== */
 #media-toolbar {
   height: 44px;
@@ -1286,7 +1394,8 @@ body {
 }
 
 .toolbar-search {
-  height: 30px;
+  /* 与标题栏按钮统一 32px：原先这里 30px，两种控件高度差在视觉上很明显 */
+  height: 32px;
   min-width: 220px;
   max-width: 520px;
   flex: 1;
@@ -1315,7 +1424,8 @@ body {
 }
 
 .toolbar-filter {
-  height: 30px;
+  /* 与搜索框、标题栏按钮统一 32px */
+  height: 32px;
   padding: 0 12px;
   border: 1px solid var(--border-color);
   border-radius: 999px;
@@ -1347,8 +1457,15 @@ body {
 .image-card {
   position: relative;
   min-height: 150px;
+  /* 大目录里跳过屏外卡片的布局。代价是 getBoundingClientRect() 对没渲染过的
+     卡片只会返回 contain-intrinsic-size 的占位高度，所以方向键量几何尺寸前
+     会临时加上 #image-grid.measuring-geometry 把这一条关掉（见 measureCardRects）。 */
   content-visibility: auto;
   contain-intrinsic-size: auto 240px;
+}
+
+#image-grid.measuring-geometry .image-card {
+  content-visibility: visible;
 }
 
 .image-card .media-thumb {
@@ -1495,4 +1612,91 @@ html.is-scrolling .image-card:hover {
   text-overflow: ellipsis;
   pointer-events: none;
   backdrop-filter: blur(6px);
+}
+
+/* ===== 操作反馈 Toast ===== */
+#toast-host {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: 2000;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  max-width: min(560px, 80vw);
+  padding: 10px 12px 10px 14px;
+  border-radius: 10px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  font-size: 13px;
+  line-height: 1.4;
+  pointer-events: auto;
+  animation: toast-in 0.18s ease-out;
+}
+
+.toast-text {
+  flex: 1;
+  word-break: break-word;
+  /* 批量移动失败时错误信息是多行，要保留换行 */
+  white-space: pre-line;
+}
+
+/* 用左侧色条表达类型，正文仍用 text-primary，保证对比度不受影响 */
+.toast-error {
+  border-color: var(--danger);
+  box-shadow: inset 3px 0 0 var(--danger), 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.toast-success {
+  box-shadow: inset 3px 0 0 var(--accent-blue), 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.toast-close {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.toast-close:hover {
+  background: var(--hover-bg);
+  color: var(--text-primary);
+}
+
+.toast-leaving {
+  animation: toast-out 0.18s ease-in forwards;
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes toast-out {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(8px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast,
+  .toast-leaving {
+    animation: none;
+  }
 }

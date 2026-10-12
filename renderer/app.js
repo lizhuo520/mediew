@@ -5,6 +5,7 @@ const App = {
   _lastOpTime: 0,
 
   async init() {
+    Toast.init();
     FolderTree.init(
       'folder-list',
       (path) => this.onFolderPreview(path)
@@ -23,6 +24,8 @@ const App = {
       this.selectDirectory();
     });
 
+    this.setupShortcuts();
+
     // 监听目录变化，自动刷新
     window.api.onDirectoryChanged((dirPath) => {
       if (this.fileOperationPending || Date.now() - this._lastOpTime < 2000) {
@@ -35,6 +38,46 @@ const App = {
     });
 
     await this.restoreLastDir();
+  },
+
+  /**
+   * 全局快捷键。这里只放真正全局的三条；网格内部的方向键/Enter/Delete 归
+   * Waterfall、树的方向键归 FolderTree，集中在这里会让两边抢同一组按键。
+   */
+  setupShortcuts() {
+    document.addEventListener('keydown', (event) => {
+      const inField = Boolean(event.target.closest && event.target.closest('input, textarea'));
+      const plainCtrl = event.ctrlKey && !event.altKey && !event.shiftKey;
+
+      if (plainCtrl && event.key.toLowerCase() === 'o') {
+        event.preventDefault();
+        this.selectDirectory();
+        return;
+      }
+
+      if (plainCtrl && event.key.toLowerCase() === 'f') {
+        event.preventDefault();
+        const input = document.getElementById('media-search');
+        if (input) {
+          input.focus();
+          input.select();
+        }
+        return;
+      }
+
+      if (event.key === 'F5') {
+        event.preventDefault();
+        this.loadImagesForCurrentPreview();
+        return;
+      }
+
+      // 搜索框里按 Esc：清空条件并退回网格，省得再拿鼠标点小叉
+      if (event.key === 'Escape' && inField && event.target.id === 'media-search') {
+        event.target.value = '';
+        event.target.blur();
+        Waterfall.applyFilters();
+      }
+    });
   },
 
   async restoreLastDir() {

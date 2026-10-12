@@ -10,7 +10,7 @@ function subscribe(channel, callback) {
 }
 
 contextBridge.exposeInMainWorld('api', {
-  selectDirectory: () => ipcRenderer.invoke('select-directory'),
+  selectDirectory: (title) => ipcRenderer.invoke('select-directory', title),
   readDirectory: (dirPath, sortMode, sortDir, recursive) => ipcRenderer.invoke('read-directory', dirPath, sortMode, sortDir, Boolean(recursive)),
   cancelDirectoryScan: () => ipcRenderer.invoke('cancel-directory-scan'),
   onMediaMetadataUpdated: (callback) => subscribe('media-metadata-updated', callback),
@@ -28,6 +28,7 @@ contextBridge.exposeInMainWorld('api', {
   deleteFiles: (filePaths) => ipcRenderer.invoke('delete-files', filePaths),
   renameFile: (filePath, newName) => ipcRenderer.invoke('rename-file', filePath, newName),
   moveFile: (filePath, destDir) => ipcRenderer.invoke('move-file', filePath, destDir),
+  moveFiles: (filePaths, destDir) => ipcRenderer.invoke('move-files', filePaths, destDir),
   createFolder: (parentDir, folderName) => ipcRenderer.invoke('create-folder', parentDir, folderName),
   deleteFolder: (dirPath) => ipcRenderer.invoke('delete-folder', dirPath),
   deleteFolders: (dirPaths) => ipcRenderer.invoke('delete-folders', dirPaths),
@@ -35,12 +36,15 @@ contextBridge.exposeInMainWorld('api', {
   moveFolder: (srcPath, destDir) => ipcRenderer.invoke('move-folder', srcPath, destDir),
   openInExplorer: (dirPath) => ipcRenderer.invoke('open-in-explorer', dirPath),
   showFileInExplorer: (filePath) => ipcRenderer.invoke('show-file-in-explorer', filePath),
+  openFile: (filePath) => ipcRenderer.invoke('open-file', filePath),
   copyFilePath: (filePath) => ipcRenderer.invoke('copy-file-path', filePath),
   toggleFavorite: (filePath) => ipcRenderer.invoke('toggle-favorite', filePath),
 
   minimizeWindow: () => ipcRenderer.send('window-minimize'),
   maximizeWindow: () => ipcRenderer.send('window-maximize'),
   closeWindow: () => ipcRenderer.send('window-close'),
+  isWindowMaximized: () => ipcRenderer.invoke('is-window-maximized'),
+  onWindowMaximizedChanged: (callback) => subscribe('window-maximized-changed', callback),
   watchDirectory: (dirPath) => ipcRenderer.send('watch-directory', dirPath),
   unwatchDirectory: () => ipcRenderer.send('unwatch-directory'),
   onDirectoryChanged: (callback) => subscribe('directory-changed', callback)

@@ -14,6 +14,10 @@ const Preview = {
   lastToggleTime: 0,
   _previewToken: 0,
   _preloadImages: new Map(),
+  _loadingEl: null,
+  _loadingText: null,
+  _zoomIndicator: null,
+  _zoomTimer: null,
 
   scale: 1,
   fitScale: 1,
@@ -35,6 +39,9 @@ const Preview = {
     this.prevBtn = document.querySelector('.preview-prev');
     this.nextBtn = document.querySelector('.preview-next');
     this.counter = document.querySelector('.preview-counter');
+    this._loadingEl = document.getElementById('preview-loading');
+    this._loadingText = document.getElementById('preview-loading-text');
+    this._zoomIndicator = document.getElementById('preview-zoom-indicator');
 
     document.querySelector('.preview-close').addEventListener('click', () => this.close());
 
@@ -258,6 +265,30 @@ const Preview = {
     this.container.classList.toggle('zoomed', this.scale > this.fitScale + 0.01);
   },
 
+  /**
+   * 图像区的加载态。生成 4096 预览要几秒，期间图像区是纯黑，
+   * 只在右侧信息栏写一行小字用户根本注意不到。
+   */
+  showLoading(text) {
+    if (!this._loadingEl) return;
+    if (this._loadingText && text) this._loadingText.textContent = text;
+    this._loadingEl.classList.add('visible');
+  },
+
+  hideLoading() {
+    if (this._loadingEl) this._loadingEl.classList.remove('visible');
+  },
+
+  showZoomIndicator() {
+    if (!this._zoomIndicator) return;
+    this._zoomIndicator.textContent = `${Math.round(this.scale * 100)}%`;
+    this._zoomIndicator.classList.add('visible');
+    if (this._zoomTimer) clearTimeout(this._zoomTimer);
+    this._zoomTimer = setTimeout(() => {
+      this._zoomIndicator.classList.remove('visible');
+    }, 1200);
+  },
+
   zoomTo(target, animate) {
     const oldScale = this.scale;
     this.scale = Math.max(0.05, Math.min(this.maxScale * 2, target));
@@ -273,6 +304,7 @@ const Preview = {
 
     this.clampPan();
     this.applyTransform(animate);
+    this.showZoomIndicator();
   },
 
   open(imageList, index) {
@@ -288,6 +320,7 @@ const Preview = {
 
   close() {
     this._previewToken += 1;
+    this.hideLoading();
     this.modal.classList.remove('active');
     this.image.onload = null;
     this.image.onerror = null;
@@ -321,6 +354,7 @@ const Preview = {
     this.isVideo = img.type === 'video';
 
     if (this.isVideo) {
+      this.hideLoading();
       this.image.style.display = 'none';
       this.video.style.display = 'block';
       this.container.classList.add('video-mode');
@@ -350,20 +384,29 @@ const Preview = {
     this.container.classList.remove('video-mode');
     this.updateNav();
     this.updateInfo(img);
+    this.showLoading(this.needsGeneratedPreview(img) ? '正在生成预览…' : '正在加载…');
     const token = ++this._previewToken;
     this.image.onload = () => {
       if (token === this._previewToken) this.onImageReady();
     };
     this.image.onerror = () => {
-      if (token === this._previewToken) document.getElementById('info-dimensions').textContent = '加载失败';
+      if (token !== this._previewToken) return;
+      this.hideLoading();
+      document.getElementById('info-dimensions').textContent = '加载失败';
     };
 
     if (this.needsGeneratedPreview(img)) {
-      document.getElementById('info-dimensions').textContent = img.isRaw ? '正在生成 RAW 预览...' : '正在生成预览...';
+      const generatingText = img.isRaw ? '正在生成 RAW 预览…' : '正在生成预览…';
+      this.showLoading(generatingText);
+      document.getElementById('info-dimensions').textContent = generatingText;
       const result = await window.api.getPreview(img.path);
       if (token !== this._previewToken || !this.isOpen) return;
       if (!result.success) {
-        document.getElementById('info-dimensions').textContent = result.error || '预览不可用';
+        const message = result.error || '预览不可用';
+        this.hideLoading();
+        document.getElementById('info-dimensions').textContent = message;
+        // 信息栏在右侧、图像区是空的，只有这一行小字太容易被忽略，再弹一次提示
+        Toast.error(`${img.name}：${message}`);
         // 生成失败也要预热相邻项，避免连续翻页时每张都从零等待。
         this.prefetchAdjacent();
         return;
@@ -375,6 +418,7 @@ const Preview = {
   },
 
   onImageReady() {
+    this.hideLoading();
     this.calcScales();
     this.scale = this.fitScale;
     this.panX = 0;
@@ -630,6 +674,7 @@ const Preview = {
           });
         } else {
           App.fileOperationPending = false;
+          Toast.error(result.error || '重命名失败');
         }
       }
       const restored = document.createElement('span');

@@ -2,7 +2,9 @@ const ThemeManager = {
   STORAGE_KEY: 'Mediew-theme',
 
   init() {
-    const saved = localStorage.getItem(this.STORAGE_KEY) || 'light';
+    // 默认深色：与 main.js 的窗口底色 #15202b、以及产品定位（Twitter 深色）一致。
+    // 以前默认 light，启动瞬间会先闪一下深色窗口再变白。
+    const saved = localStorage.getItem(this.STORAGE_KEY) || 'dark';
     this.apply(saved);
 
     document.getElementById('btn-theme').addEventListener('click', () => {
@@ -249,9 +251,25 @@ document.getElementById('btn-minimize').addEventListener('click', () => {
   window.api.minimizeWindow();
 });
 
-document.getElementById('btn-maximize').addEventListener('click', () => {
+const btnMaximize = document.getElementById('btn-maximize');
+
+function applyMaximizeState(isMaximized) {
+  btnMaximize.textContent = isMaximized ? '❐' : '□';
+  btnMaximize.title = isMaximized ? '向下还原' : '最大化';
+  btnMaximize.setAttribute('aria-label', isMaximized ? '向下还原' : '最大化');
+}
+
+btnMaximize.addEventListener('click', () => {
   window.api.maximizeWindow();
 });
+
+if (window.api.onWindowMaximizedChanged) {
+  window.api.onWindowMaximizedChanged((isMaximized) => applyMaximizeState(Boolean(isMaximized)));
+}
+// 标题栏双击/系统快捷键也能最大化，启动时先问一次当前状态
+if (window.api.isWindowMaximized) {
+  window.api.isWindowMaximized().then((isMaximized) => applyMaximizeState(Boolean(isMaximized))).catch(() => {});
+}
 
 document.getElementById('btn-close').addEventListener('click', () => {
   window.api.closeWindow();

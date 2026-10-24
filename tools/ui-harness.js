@@ -11,6 +11,9 @@ const path = require('node:path');
 const fs = require('node:fs');
 
 app.disableHardwareAcceleration();
+if (process.env.MEDIEW_UI_DPR) {
+  app.commandLine.appendSwitch('force-device-scale-factor', process.env.MEDIEW_UI_DPR);
+}
 
 const outDir = process.env.MEDIEW_UI_OUT || __dirname;
 fs.mkdirSync(outDir, { recursive: true });
@@ -171,6 +174,8 @@ async function run() {
       const original = {
         showing: Preview._showingOriginal,
         scale: Preview.scale,
+        dpr: window.devicePixelRatio,
+        pixelPerfect: Math.abs(Preview.scale * window.devicePixelRatio - 1) < 0.001,
         buttonText: document.getElementById('preview-original').textContent,
         buttonActive: document.getElementById('preview-original').classList.contains('active'),
         fullRequests: window.api.getPreviewFullRequests().length

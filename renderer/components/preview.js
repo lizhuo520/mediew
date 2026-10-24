@@ -286,7 +286,7 @@ const Preview = {
     // 正在看原图时保持 100%，适应窗口时按旋转后的尺寸重新适配。
     const keepOriginal = this._showingOriginal;
     this.calcScales();
-    this.scale = keepOriginal ? 1 : this.fitScale;
+    this.scale = keepOriginal ? this.getPixelScale() : this.fitScale;
     this.panX = 0;
     this.panY = 0;
     this.clampPan();
@@ -332,7 +332,7 @@ const Preview = {
     }
 
     this._showingOriginal = true;
-    this.scale = 1;
+    this.scale = this.getPixelScale();
     this.panX = 0;
     this.panY = 0;
     this.clampPan();
@@ -415,15 +415,30 @@ const Preview = {
     );
   },
 
+  getDevicePixelRatio() {
+    return window.devicePixelRatio || 1;
+  },
+
+  /** 让 1 个图像像素落在 1 个物理像素上（4K@150% 时是 0.667 CSS 比例）。 */
+  getPixelScale() {
+    return 1 / this.getDevicePixelRatio();
+  },
+
+  getEffectiveScale() {
+    return this.scale * this.getDevicePixelRatio();
+  },
+
   calcScales() {
     const { width: nW, height: nH } = this.getRotatedNaturalSize();
     if (!nW || !nH) return;
 
     const { w: vW, h: vH } = this.getViewSize();
+    const pixelScale = this.getPixelScale();
 
     this.fitScale = Math.min(vW / nW, vH / nH);
-    if (this.fitScale > 1) this.fitScale = 1;
-    // 允许「原图」切到 100%，即使高分辨率图的适配比例小于 1。
+    // 不把小图放大超过物理 1:1；此前上限是 1，在 150% 缩放下会放大 1.5 倍。
+    if (this.fitScale > pixelScale) this.fitScale = pixelScale;
+    // 允许「原图」切到物理 1:1，也允许适度放大查看。
     this.maxScale = Math.max(this.fitScale * 5, 1);
   },
 
@@ -470,7 +485,8 @@ const Preview = {
 
   showZoomIndicator() {
     if (!this._zoomIndicator) return;
-    this._zoomIndicator.textContent = `${Math.round(this.scale * 100)}%`;
+    // 显示物理缩放比：4K@150% 下 scale=0.667 才是真正的 100%。
+    this._zoomIndicator.textContent = `${Math.round(this.getEffectiveScale() * 100)}%`;
     this._zoomIndicator.classList.add('visible');
     if (this._zoomTimer) clearTimeout(this._zoomTimer);
     this._zoomTimer = setTimeout(() => {
@@ -679,7 +695,7 @@ const Preview = {
     this.image = incoming;
     this.standbyImage = incoming === this._layerA ? this._layerB : this._layerA;
     this.calcScales();
-    this.scale = this._showingOriginal ? 1 : this.fitScale;
+    this.scale = this._showingOriginal ? this.getPixelScale() : this.fitScale;
     this.panX = 0;
     this.panY = 0;
     if (this._showingOriginal && img) this._fullPreviewPath = img.path;
@@ -709,8 +725,11 @@ const Preview = {
       let suffix = img.isRaw ? ' · RAW 预览' : '';
       if (this._showingOriginal) suffix += ' · 原图';
       if (this.rotation) suffix += ` · 旋转 ${this.rotation}°`;
-      const width = img.width > 0 ? img.width : incoming.naturalWidth;
-      const height = img.height > 0 ? img.height : incoming.naturalHeight;
+      // 「原图」显示实际解码出的像素尺寸；RAW 的内嵌全尺寸 JPEG 可能略小于
+      // 传感器尺寸（例如 6208×4092 的 NEF 内嵌图是 6144×4080），如实显示。
+      const useDecodedSize = this._showingOriginal && this.needsGeneratedPreview(img);
+      const width = useDecodedSize ? incoming.naturalWidth : (img.width > 0 ? img.width : incoming.naturalWidth);
+      const height = useDecodedSize ? incoming.naturalHeight : (img.height > 0 ? img.height : incoming.naturalHeight);
       const display = MediewOrientation.rotatedSize(width, height, this.rotation);
       document.getElementById('info-dimensions').textContent = `${display.width} × ${display.height} px${suffix}`;
       this.prefetchAdjacent();

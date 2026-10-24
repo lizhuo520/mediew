@@ -314,6 +314,44 @@ test('生成缩略图后源文件不会被占用（.webp / .gif 回归）', asyn
   }
 });
 
+test('RAW 预览优先选全尺寸内嵌 JPEG，而不是小 PreviewImage', async () => {
+  const userDataDir = await makeTempDirectory('mediew-raw-pick-');
+  const service = new MediaService({ userDataPath: userDataDir });
+  await service.initialize();
+  try {
+    // Nikon NEF 实测：PreviewImage 只有 570×375，JpgFromRaw 是 6144×4080。
+    // 旧代码按固定顺序先拿 PreviewImage，导致「原图」仍是缩略图。
+    const small = await sharp({ create: { width: 570, height: 375, channels: 3, background: '#333333' } })
+      .jpeg()
+      .toBuffer();
+    const full = await sharp({ create: { width: 3200, height: 2000, channels: 3, background: '#666666' } })
+      .jpeg()
+      .toBuffer();
+    service.getSourceOrientation = async () => 1;
+    service.exiftool.extractBinaryTagToBuffer = async (tagName) => {
+      if (tagName === 'JpgFromRaw') return full;
+      if (tagName === 'PreviewImage') return small;
+      return null;
+    };
+
+    const target = path.join(userDataDir, 'picked.jpg');
+    const result = await service.generateRawImage(
+      'fake.nef',
+      target,
+      16384,
+      { extension: '.nef' },
+      95
+    );
+    assert.match(result.source, /JpgFromRaw/);
+    const meta = await sharp(target).metadata();
+    assert.equal(meta.width, 3200, '应选 3200×2000 的全尺寸内嵌图');
+    assert.equal(meta.height, 2000);
+  } finally {
+    await service.dispose();
+    await removeTempDirectory(userDataDir);
+  }
+});
+
 test('真实 RAW 样片可生成缓存缩略图与预览', { skip: !process.env.MEDIEW_RAW_FIXTURE }, async () => {
   const rawPath = process.env.MEDIEW_RAW_FIXTURE;
   assert.equal(fs.existsSync(rawPath), true, `RAW 样片不存在：${rawPath}`);

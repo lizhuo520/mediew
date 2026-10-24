@@ -39,7 +39,9 @@ const PREVIEW_FULL_MAX = 16384;
 const PREVIEW_FULL_QUALITY = 95;
 
 // 缓存内容版本号：缩略图/预览的语义变化时递增，旧条目会因为键变化而自动失效。
-const CACHE_VERSION = 'v3-orientation';
+// v4：RAW 内嵌预览改为优先全尺寸 JpgFromRaw；旧缓存里可能是 570×375 的
+// PreviewImage，必须整体失效，否则升级后仍会读到糊图。
+const CACHE_VERSION = 'v4-rawpreview';
 
 // 宽高比探测的并发上限。sharp 只读文件头，属于轻量 IO 任务，
 // 但 Windows 上过高的并发会让磁盘队列变长，因此取 16。
@@ -698,20 +700,35 @@ class MediaService {
 
     // 直接从 ExifTool 读取二进制预览，避免 Windows 临时文件句柄未释放导致 EPERM。
     const sourceOrientation = await this.getSourceOrientation(filePath);
-    const previewTags = ['PreviewImage', 'JpgFromRaw', 'ThumbnailImage', 'OtherImage'];
+    // 不能按固定顺序拿第一个：Nikon NEF 同时带 570×375 的 PreviewImage 和
+    // 6144×4080 的 JpgFromRaw，先拿 PreviewImage 会让「原图」糊成缩略图。
+    // 先试最可能全尺寸的标签，再按实际像素面积挑最大的一张。
+    const previewTags = ['JpgFromRaw', 'OtherImage', 'PreviewImage', 'ThumbnailImage'];
+    let bestPreview = null;
     for (const tagName of previewTags) {
       try {
         const buffer = await this.exiftool.extractBinaryTagToBuffer(tagName, filePath);
-        if (buffer && buffer.length > 0) {
-          const embedded = await sharp(buffer, { failOn: 'none', limitInputPixels: MAX_INPUT_PIXELS }).metadata();
-          const embeddedOrientation = Orientation.normalize(embedded && embedded.orientation);
-          const explicitOrientation = embeddedOrientation === 1 && sourceOrientation !== 1 ? sourceOrientation : null;
-          await this.resizeWithSharp(buffer, targetPath, maxSize, quality, { explicitOrientation });
-          return { source: `buffer:${tagName}` };
+        if (!buffer || buffer.length === 0) continue;
+        const embedded = await sharp(buffer, { failOn: 'none', limitInputPixels: MAX_INPUT_PIXELS }).metadata();
+        const width = Number(embedded && embedded.width) || 0;
+        const height = Number(embedded && embedded.height) || 0;
+        if (width <= 0 || height <= 0) continue;
+        const area = width * height;
+        if (!bestPreview || area > bestPreview.area) {
+          bestPreview = { buffer, tagName, area, width, height, orientation: embedded.orientation };
         }
+        // 已经拿到接近传感器尺寸的内嵌图，不必再为缩略图标签多开进程。
+        if (width >= 3000) break;
       } catch (error) {
         lastError = error;
       }
+    }
+
+    if (bestPreview) {
+      const embeddedOrientation = Orientation.normalize(bestPreview.orientation);
+      const explicitOrientation = embeddedOrientation === 1 && sourceOrientation !== 1 ? sourceOrientation : null;
+      await this.resizeWithSharp(bestPreview.buffer, targetPath, maxSize, quality, { explicitOrientation });
+      return { source: `buffer:${bestPreview.tagName}:${bestPreview.width}x${bestPreview.height}` };
     }
 
     if (!preferSharp) {

@@ -33,10 +33,13 @@ function toDate(value) {
  * dateSource 会明确标记日期来自 EXIF 还是文件修改时间，便于排查显示异常。
  */
 function buildDateInfo(value, dateSource = 'mtime') {
-  const d = toDate(value) || new Date(0);
-  if (Number.isNaN(d.getTime())) {
+  const d = toDate(value);
+  // 解析不出来时返回「未知日期」，绝不退回 new Date(0)。
+  // 之前用 1970 兜底会让相机时间未设置的坏 EXIF 值显示成 1970-01-01，
+  // 并且被 mtime 排序顶到列表最前面，用户会看到一批「1970 年的照片」。
+  if (!d) {
     return {
-      date: '未知日期', year: '', month: '', day: '', hour: '', dateSource
+      date: '未知日期', year: '未知', month: '未知', day: '未知', hour: '未知', dateSource
     };
   }
   const year = String(d.getFullYear());

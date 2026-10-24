@@ -20,8 +20,8 @@ function isSaneDimension(value) {
  *
  * 目标与 gkpv 的 readImageSize() 一致（先用便宜的方式拿到宽高比，
  * 避免缩略图到达后整屏跳动），但实现改用 sharp/libvips 的 metadata()：
- * - 不必自己解析 PNG/JPEG/WebP/GIF/BMP 的字节结构；
- * - 能覆盖 gkpv 解析不了的 TIFF 和 HEIC —— gkpv 的 readImageSize() 没有 TIFF 分支，
+ * - 不必自己解析 PNG/JPEG/WebP/GIF 的字节结构；
+ * - 能覆盖 gkpv 解析不了的 TIFF —— gkpv 的 readImageSize() 没有 TIFF 分支，
  *   .tif 永远返回 null，导致 TIFF 只能按 1:1 正方形排版；
  * - 不做像素解码，代价与读一次文件头相当。
  *

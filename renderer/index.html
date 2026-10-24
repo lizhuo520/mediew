@@ -71,11 +71,11 @@
     </main>
   </div>
 
-  <div id="preview-modal">
+  <div id="preview-modal" role="dialog" aria-modal="true" aria-label="图片预览" tabindex="-1">
     <div class="preview-backdrop"></div>
     <div class="preview-content">
       <div class="preview-image-area">
-        <button class="preview-close" title="关闭">✕</button>
+        <button class="preview-close" title="关闭" aria-label="关闭预览">✕</button>
         <button class="preview-nav preview-prev" title="上一张 (←)">
           <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
             <path d="M15.41 7.41L14 6l-6 6 6 6 1.41-1.41L10.83 12z"/>
@@ -271,7 +271,6 @@
   <div id="zoom-indicator"></div>
   <div id="toast-host" aria-live="polite" aria-atomic="false"></div>
 
-  <script src="utils/date-formatter.js"></script>
   <script src="utils/orientation.js"></script>
   <script src="utils/masonry.js"></script>
   <script src="utils/grid-nav.js"></script>

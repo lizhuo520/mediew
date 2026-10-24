@@ -29,6 +29,9 @@ const Preview = {
   _rotationMap: null,
   _showingOriginal: false,
   _originalLoading: false,
+  // 打开灯箱前的焦点归属，关闭时还回去（否则焦点会掉到 body，键盘用户迷路）。
+  _lastFocused: null,
+  _resizeTimer: null,
 
   rotation: 0,
   ROTATION_KEY: 'Mediew-manual-rotation',
@@ -118,6 +121,69 @@ const Preview = {
 
     this.initVideoPlayer();
     this.updateOriginalButton();
+
+    // 窗口尺寸变了，fitScale/maxScale 就过期了：不重算的话「适应窗口」的图会
+    // 保持旧尺寸（拉大窗口留黑边、缩小窗口被裁掉）。200ms 防抖避免拖动时狂算。
+    window.addEventListener('resize', () => {
+      if (!this.isOpen) return;
+      if (this._resizeTimer) clearTimeout(this._resizeTimer);
+      this._resizeTimer = setTimeout(() => {
+        this._resizeTimer = null;
+        if (this.isOpen) this.handleResize();
+      }, 200);
+    });
+
+    this.modal.addEventListener('keydown', (event) => this.trapFocus(event));
+  },
+
+  /**
+   * 灯箱是 aria-modal 的 dialog，Tab 不该跑到背后的网格上去。
+   * 用 keydown 拦截而不是把背景设 inert：后者要改 DOM 树结构，风险更大。
+   */
+  trapFocus(event) {
+    if (event.key !== 'Tab' || !this.isOpen) return;
+    const focusable = this.getFocusableElements();
+    if (focusable.length === 0) {
+      event.preventDefault();
+      this.modal.focus();
+      return;
+    }
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const current = document.activeElement;
+    if (event.shiftKey) {
+      if (current === first || !this.modal.contains(current)) {
+        event.preventDefault();
+        last.focus();
+      }
+    } else if (current === last || !this.modal.contains(current)) {
+      event.preventDefault();
+      first.focus();
+    }
+  },
+
+  getFocusableElements() {
+    if (!this.modal) return [];
+    const selector = 'button:not([disabled]), [href], input:not([disabled]), select, textarea, [tabindex]:not([tabindex="-1"])';
+    return Array.from(this.modal.querySelectorAll(selector)).filter((el) => {
+      if (el.closest('[aria-hidden="true"]')) return false;
+      // 不可见元素（隐藏的视频控制条、当前没显示的旋转按钮）不该吃到 Tab。
+      return el.offsetParent !== null || el === document.activeElement;
+    });
+  },
+
+  /**
+   * 尺寸变化后重算缩放。看原图时保持"1 图像像素 = 1 物理像素"，
+   * 其余情况重新贴回 fitScale，再夹一遍平移量避免图被拖出可视区。
+   */
+  handleResize() {
+    if (!this.isOpen || this.isVideo) return;
+    const { width, height } = this.getRotatedNaturalSize();
+    if (!width || !height) return;
+    this.calcScales();
+    this.scale = this._showingOriginal ? this.getPixelScale() : this.fitScale;
+    this.clampPan();
+    this.applyTransform(false);
   },
 
   initVideoPlayer() {
@@ -324,7 +390,7 @@ const Preview = {
       return;
     }
 
-    // 普通格式当前就是原图，直接切到 100%；RAW/TIFF/HEIC 需要主进程生成
+    // 普通格式当前就是原图，直接切到 100%；RAW/TIFF 需要主进程生成
     // 全分辨率 JPEG（默认预览最长边只到 4096）。
     if (this.needsGeneratedPreview(img) && this._fullPreviewPath !== img.path) {
       await this.loadFullPreview(img);
@@ -375,7 +441,21 @@ const Preview = {
       Toast.error(`${img.name}：原图加载失败`);
     };
 
-    const result = await window.api.getPreview(img.path, { full: true });
+    let result;
+    try {
+      result = await window.api.getPreview(img.path, { full: true });
+    } catch (err) {
+      // 主进程抛错（sharp 崩了/文件被独占/临时目录不可写）时，裸 await 会把
+      // 整个函数 reject 掉：loading 遮罩永远转、"原图"按钮永久 disabled。
+      if (token !== this._previewToken) return;
+      this._originalLoading = false;
+      this.hideLoading();
+      this._showingOriginal = false;
+      this.updateOriginalButton();
+      if (outgoing && outgoing.classList.contains('loaded')) outgoing.style.opacity = '1';
+      Toast.error(`${img.name}：${err?.message || '原图加载失败'}`);
+      return;
+    }
     if (token !== this._previewToken || !this.isOpen) return;
     if (!result.success) {
       this._originalLoading = false;
@@ -392,13 +472,16 @@ const Preview = {
   /**
    * 灯箱取图策略（对齐 gkpv）：
    * 浏览器能直接解码的格式一律加载原图，保留最高缩放质量；
-   * TIFF / HEIC / RAW 浏览器解不了，必须由主进程生成缓存 JPEG 预览。
+   * TIFF / RAW 浏览器解不了，必须由主进程生成缓存 JPEG 预览。
+   *
+   * HEIC/HEIF 已从「需要生成」名单里去掉：它们已被扫描阶段过滤，不会走到灯箱。
+   * 留在这里只会让人误以为该格式可用。
    */
   needsGeneratedPreview(imageInfo) {
     if (!imageInfo) return false;
     if (imageInfo.isRaw) return true;
     const extension = (imageInfo.extension || '').toLowerCase();
-    return ['.tif', '.tiff', '.heic', '.heif'].includes(extension);
+    return ['.tif', '.tiff'].includes(extension);
   },
 
   getViewSize() {
@@ -540,6 +623,13 @@ const Preview = {
     this.imageList = imageList;
     this.currentIndex = index;
     this.isOpen = true;
+    // 灯箱已经开着时又会走一次 open()（删图/移图后重建索引会再调一次）。
+    // 那种情况下 activeElement 已经在灯箱内部，记下来只会在关闭时把焦点还回
+    // 一个即将隐藏的按钮，所以只在焦点确实在外部时才记录。
+    const activeEl = document.activeElement;
+    if (!this._lastFocused || !activeEl || !this.modal.contains(activeEl)) {
+      this._lastFocused = activeEl;
+    }
     this.panX = 0;
     this.panY = 0;
     this.scale = 1;
@@ -550,6 +640,11 @@ const Preview = {
     this.resetLayers();
     this.showImage(0, { immediate: true });
     this.modal.classList.add('active');
+    // dialog 打开后焦点要进来，否则 Tab 还在背后的网格里游走，
+    // 读屏也不会宣告"进入了预览"。
+    const focusTarget = this.modal.querySelector('.preview-close');
+    if (focusTarget) focusTarget.focus();
+    else this.modal.focus();
   },
 
   close() {
@@ -575,6 +670,18 @@ const Preview = {
     this.updateOriginalButton();
     for (const preload of this._preloadImages.values()) preload.src = '';
     this._preloadImages.clear();
+    if (this._resizeTimer) {
+      clearTimeout(this._resizeTimer);
+      this._resizeTimer = null;
+    }
+    // 焦点归还给打开灯箱的那张卡片，键盘用户能接着原地上下移动。
+    const lastFocused = this._lastFocused;
+    this._lastFocused = null;
+    if (lastFocused && lastFocused.isConnected) {
+      lastFocused.focus?.();
+    } else if (typeof Waterfall !== 'undefined' && Waterfall.focusCardAt) {
+      Waterfall.focusCardAt(Waterfall._keyboardIndex);
+    }
   },
 
   async showImage(direction = 1, options = {}) {
@@ -669,7 +776,20 @@ const Preview = {
       const generatingText = img.isRaw ? '正在生成 RAW 预览…' : '正在生成预览…';
       this.showLoading(generatingText);
       document.getElementById('info-dimensions').textContent = generatingText;
-      const result = await window.api.getPreview(img.path);
+      let result;
+      try {
+        result = await window.api.getPreview(img.path);
+      } catch (err) {
+        // 同 loadFullPreview：这里 reject 会让 loading 遮罩永久转圈。
+        if (token !== this._previewToken || !this.isOpen) return;
+        const message = err?.message || '预览加载失败';
+        this.hideLoading();
+        document.getElementById('info-dimensions').textContent = message;
+        Toast.error(`${img.name}：${message}`);
+        if (outgoing && outgoing.classList.contains('loaded')) outgoing.style.opacity = '1';
+        this.prefetchAdjacent();
+        return;
+      }
       if (token !== this._previewToken || !this.isOpen) return;
       if (!result.success) {
         const message = result.error || '预览不可用';

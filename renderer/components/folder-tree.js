@@ -35,6 +35,8 @@ const FolderTree = {
   rootPath: null,
   onFolderPreview: null,
   _dragPath: null,
+  // loadFolders 的异步代次：切根目录时旧请求的结果一律丢弃。
+  _loadGeneration: 0,
 
   selectedFolders: new Set(),
   lastClickedFolderIndex: -1,
@@ -568,7 +570,11 @@ const FolderTree = {
       App.currentPath = null;
       App.currentPreviewPath = null;
       document.getElementById('directory-path').textContent = '选择目录...';
-      document.getElementById('image-grid').innerHTML = '';
+      // 只清 grid 的 DOM 不够：Waterfall 里的 allImages/selectedPaths/_cardByPath
+      // 还留着已删目录的内容，之后任何 rebuild 都会把它们重新渲染回来（或者
+      // 让 Delete 作用在已不存在的路径上）。
+      if (typeof Waterfall !== 'undefined' && Waterfall.reset) Waterfall.reset();
+      else document.getElementById('image-grid').innerHTML = '';
       document.getElementById('welcome-screen').classList.remove('hidden');
       await this.reloadTree();
       return;
@@ -628,6 +634,10 @@ const FolderTree = {
   },
 
   async loadFolders(dirPath) {
+    // 每次换根目录都发一张"票"。getSubfolders 是 await 的，慢盘/网络盘上
+    // 上一次的结果可能比这一次还晚回来，那种情况下必须整个丢弃，否则树会被
+    // 旧目录的内容覆盖（还会把 rootPath 指回旧路径）。
+    const generation = ++this._loadGeneration;
     this.rootPath = dirPath;
     this.container.innerHTML = '';
     this.clearSelection();
@@ -662,6 +672,7 @@ const FolderTree = {
     this.previewFolder(dirPath, rootItem);
     
     const folders = await window.api.getSubfolders(dirPath);
+    if (generation !== this._loadGeneration) return;
     
     if (folders.length === 0) {
       this.syncTreeRovingTabIndex(0);
@@ -669,9 +680,13 @@ const FolderTree = {
     }
 
     for (const folder of folders) {
+      // createFolderItem 内部还有 await（懒加载图标/统计），逐项复查代次。
+      if (generation !== this._loadGeneration) return;
       const item = await this.createFolderItem(dirPath, folder);
+      if (generation !== this._loadGeneration) return;
       rootWrapper.appendChild(item);
     }
+    if (generation !== this._loadGeneration) return;
     this.syncTreeRovingTabIndex(0);
   },
 

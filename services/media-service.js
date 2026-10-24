@@ -14,6 +14,7 @@ const { getMediaInfo } = require('./media-types');
 const { probeImageSize } = require('./image-size');
 const { createLimiter, mapWithConcurrency } = require('./concurrency');
 const { MetadataCache } = require('./metadata-cache');
+const { cleanupStale, enforceCacheLimits } = require('./cache-maintenance');
 const {
   buildDateInfo,
   formatAperture,
@@ -46,9 +47,14 @@ const CACHE_VERSION = 'v4-rawpreview';
 // 宽高比探测的并发上限。sharp 只读文件头，属于轻量 IO 任务，
 // 但 Windows 上过高的并发会让磁盘队列变长，因此取 16。
 const DIMENSION_CONCURRENCY = 16;
+
+// 退出时等待在途 enrich 的上限。宁可丢最后几条元数据，也不能让窗口关不掉。
+const DISPOSE_ENRICH_TIMEOUT_MS = 5000;
 const SKIP_DIRECTORY_NAMES = new Set([
   'node_modules', '.git', '.svn', '.hg', '$recycle.bin', 'system volume information'
 ]);
+// 子目录名排序（中文按拼音、数字按大小）。Collator 构造有 ICU 初始化开销，模块级复用。
+const SUBFOLDER_COLLATOR = new Intl.Collator('zh-CN', { numeric: true });
 const EXIF_PICK = [
   'DateTimeOriginal', 'DateTimeDigitized', 'CreateDate',
   'Make', 'Model', 'LensModel', 'LensID',
@@ -169,7 +175,6 @@ class MediaService {
       streamFlushMillis: 10
     });
 
-    this.metadataLimiter = createLimiter(4);
     this.thumbnailLimiter = createLimiter(4);
     this.previewLimiter = createLimiter(2);
     this.thumbnailInflight = new Map();
@@ -178,6 +183,18 @@ class MediaService {
     this.scanSequence = 0;
     this.favorites = new Set();
     this.favoriteSaveTimer = null;
+    // 本次会话的「收藏损坏恢复文件」路径，保证一次运行只写一份 recovered。
+    this.favoritesRecoveryFile = null;
+    // 收藏文件损坏后置 false：此时绝不能拿空 Set 覆写用户原有的 favorites.json。
+    this.favoritesLoadedCleanly = true;
+    // 后台 enrich 任务（EXIF / 宽高比）的持有集合，dispose() 要等它们跑完再 flush。
+    this.pendingEnrich = new Set();
+    // 退出流程中置 true：此时取消标记只用于「不再向渲染层推送」，
+    // 但排队中的 enrich 仍要跑完，否则最后几百条 EXIF 白读、下次启动重来。
+    this.drainingForExit = false;
+    // 缩略图/预览失败负缓存：path|signature -> { failAt, error }，5 分钟内不再重解码。
+    this.failureCache = new Map();
+    this.failureTtlMs = 5 * 60 * 1000;
   }
 
   async initialize() {
@@ -189,6 +206,25 @@ class MediaService {
       this.dimensionCache.load(),
       this.loadFavorites()
     ]);
+
+    // 缓存清理放到后台跑，不能拖慢首屏。
+    this.cleanupCaches().catch(() => {});
+  }
+
+  /**
+   * 启动期缓存维护：先删旧版本 JSON / 孤儿 .tmp / 过期 temp，再按容量与年龄淘汰缩略图与预览。
+   * 全流程静默失败——清理只是止损，任何异常都不该影响应用可用性。
+   */
+  async cleanupCaches() {
+    await cleanupStale({
+      userDataPath: this.userDataPath,
+      cacheRoot: this.cacheRoot,
+      keepCacheFiles: [this.metadataCache.cacheFile, this.dimensionCache.cacheFile, this.favoritesFile]
+    }).catch(() => {});
+    await enforceCacheLimits({
+      cacheRoot: this.cacheRoot,
+      maxAgeDays: 180
+    }).catch(() => {});
   }
 
   /**
@@ -211,16 +247,28 @@ class MediaService {
       return { scanId, items: [], pendingCount: 0, recursive };
     }
 
-    const items = await mapWithConcurrency(mediaEntries, 16, async (entry) => {
-      const stat = await fsp.stat(entry.filePath);
-      return this.createBaseItem(entry.filePath, stat, getMediaInfo(entry.filePath), entry.relativePath);
+    // 单个文件在 readdir 与 stat 之间消失（同步盘、相机卡导入、杀软独占）非常常见，
+    // 必须逐条容错：任何一条 stat 失败只能跳过该文件，不能让整次扫描归零。
+    // 结果按下标回填，保持与 readdir 一致的确定性顺序（同 mtime 的文件不会随机排序）。
+    const slots = new Array(mediaEntries.length);
+    await mapWithConcurrency(mediaEntries, 16, async (entry, index) => {
+      if (scan.cancelled) return;
+      try {
+        const stat = await fsp.stat(entry.filePath);
+        slots[index] = this.createBaseItem(entry.filePath, stat, getMediaInfo(entry.filePath), entry.relativePath);
+      } catch (_) {
+        // 单个文件消失 / 无权限：跳过，不影响整次扫描。
+      }
     });
+    const items = slots.filter(Boolean);
 
     items.sort((a, b) => a.mtime - b.mtime);
     const pending = items.filter((item) => item.metadataPending && item.type === 'image');
 
     if (pending.length > 0) {
-      this.enrichScan(scan, pending).catch((error) => {
+      const enrichPromise = this.enrichScan(scan, pending);
+      this.trackEnrich(enrichPromise);
+      enrichPromise.catch((error) => {
         if (!scan.cancelled && typeof options.onError === 'function') options.onError(error);
       });
     } else {
@@ -288,6 +336,15 @@ class MediaService {
     this.activeScan = null;
   }
 
+  /**
+   * 是否应该放弃这一条 enrich 任务。
+   * 正常取消（切换到别的目录）要立刻停手；退出（drainingForExit）则相反：
+   * dispose() 必须让队列里已经排到的条目把结果写进缓存，否则退出时白读一遍 EXIF。
+   */
+  shouldDropEnrich(scan) {
+    return Boolean(scan.cancelled) && !this.drainingForExit;
+  }
+
   createBaseItem(filePath, stat, mediaInfo, relativePath = path.basename(filePath)) {
     const signature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
     const cached = this.metadataCache.get(filePath, signature);
@@ -339,9 +396,24 @@ class MediaService {
       });
       return;
     }
-    this.enrichDimensions(scan, targets).catch((error) => {
+    const dimensionsPromise = this.enrichDimensions(scan, targets);
+    this.trackEnrich(dimensionsPromise);
+    dimensionsPromise.catch((error) => {
       if (!scan.cancelled && typeof scan.callbacks.onError === 'function') scan.callbacks.onError(error);
     });
+  }
+
+  /**
+   * 登记一个后台 enrich 任务，供 dispose() 等待其收尾。
+   * 这些任务在扫描取消后仍可能持有已经读到的 EXIF，必须让它们跑完再 flush，
+   * 否则退出时那批元数据会随进程结束一起丢掉。
+   */
+  trackEnrich(promise) {
+    if (!promise || typeof promise.then !== 'function') return promise;
+    const tracked = Promise.resolve(promise).catch(() => {});
+    this.pendingEnrich.add(tracked);
+    tracked.finally(() => this.pendingEnrich.delete(tracked));
+    return promise;
   }
 
   /**
@@ -367,7 +439,7 @@ class MediaService {
     };
 
     await mapWithConcurrency(targets, DIMENSION_CONCURRENCY, async (item) => {
-      if (scan.cancelled) return;
+      if (this.shouldDropEnrich(scan)) return;
       let size = null;
       try {
         size = await probeImageSize(item.path, { maxInputPixels: MAX_INPUT_PIXELS });
@@ -411,11 +483,13 @@ class MediaService {
       }
     };
 
+    // 外层 mapWithConcurrency 已经是 4 并发，再套一层 metadataLimiter 只是重复限流，
+    // 还会让「外层常量」和「limiter 常量」两个数字各改各的，最终并发数不可预期。
     await mapWithConcurrency(pendingItems, 4, async (item) => {
-      if (scan.cancelled) return;
+      if (this.shouldDropEnrich(scan)) return;
       let metadata;
       try {
-        metadata = await this.metadataLimiter(() => this.readMetadata(item.path, item));
+        metadata = await this.readMetadata(item.path, item);
       } catch (error) {
         metadata = {
           ...buildDateInfo(item.mtime, 'mtime'),
@@ -508,7 +582,40 @@ class MediaService {
     return entries
       .filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'))
       .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b, 'zh-CN', { numeric: true }));
+      // 每次调用都新建 Intl.Collator 会重复付出 ICU 初始化开销，提到模块级复用。
+      .sort((a, b) => SUBFOLDER_COLLATOR.compare(a, b));
+  }
+
+  /**
+   * 失败负缓存：解码失败（不支持的格式、文件损坏）在 5 分钟内同签名直接返回失败，
+   * 避免用户滚回视口时反复触发必定失败的 sharp 解码。
+   * 键带 size+mtime，文件一旦被修好就会自动换签名重试。
+   */
+  buildFailureKey(filePath, stat) {
+    return `${filePath}|${stat.size}:${Math.floor(stat.mtimeMs)}`;
+  }
+
+  getFailure(filePath, stat) {
+    const key = this.buildFailureKey(filePath, stat);
+    const entry = this.failureCache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.failAt > this.failureTtlMs) {
+      this.failureCache.delete(key);
+      return null;
+    }
+    return entry;
+  }
+
+  recordFailure(filePath, stat, error) {
+    const key = this.buildFailureKey(filePath, stat);
+    this.failureCache.set(key, {
+      failAt: Date.now(),
+      error: error && error.message ? error.message : String(error || '')
+    });
+    if (this.failureCache.size > 5000) {
+      const oldest = this.failureCache.keys().next().value;
+      if (oldest !== undefined) this.failureCache.delete(oldest);
+    }
   }
 
   /**
@@ -521,6 +628,10 @@ class MediaService {
       const mediaInfo = getMediaInfo(filePath);
       if (!mediaInfo.supported || mediaInfo.type !== 'image') {
         return { success: false, error: '该文件不是可预览图片' };
+      }
+      const known = this.getFailure(filePath, stat);
+      if (known) {
+        return { success: false, error: this.toUserError({ message: known.error }, mediaInfo), cached: true };
       }
       const key = this.createCacheKey(filePath, stat, `thumb-${size}`);
       const target = path.join(this.thumbnailRoot, `${key}.jpg`);
@@ -537,10 +648,13 @@ class MediaService {
           fromCache: false,
           source: result.source
         };
-      }).catch((error) => ({
-        success: false,
-        error: this.toUserError(error, mediaInfo)
-      })).finally(() => {
+      }).catch((error) => {
+        this.recordFailure(filePath, stat, error);
+        return {
+          success: false,
+          error: this.toUserError(error, mediaInfo)
+        };
+      }).finally(() => {
         this.thumbnailInflight.delete(key);
       });
 
@@ -554,7 +668,8 @@ class MediaService {
   /**
    * 返回预览地址。
    * 普通图片继续使用原图以保留最高缩放质量；
-   * RAW、TIFF、HEIC 等浏览器不能稳定显示的格式改为生成缓存 JPEG。
+   * RAW / TIFF 等浏览器不能稳定显示的格式改为生成缓存 JPEG。
+   * HEIC/HEIF 已从支持列表移除（当前 sharp 的 heif 解码器只声明 .avif 后缀）。
    */
   async getPreview(filePath, options = {}) {
     try {
@@ -564,7 +679,7 @@ class MediaService {
         return { success: false, error: '该文件不是可预览图片' };
       }
 
-      const needsGenerated = mediaInfo.isRaw || ['.tif', '.tiff', '.heic', '.heif'].includes(mediaInfo.extension);
+      const needsGenerated = mediaInfo.isRaw || ['.tif', '.tiff'].includes(mediaInfo.extension);
       if (!needsGenerated) {
         return {
           success: true,
@@ -580,6 +695,10 @@ class MediaService {
       const quality = full ? PREVIEW_FULL_QUALITY : PREVIEW_QUALITY;
       // 标准预览沿用旧缓存键，只有「原图」使用新的 full 键。
       const variant = full ? `preview-full-${PREVIEW_FULL_MAX}` : `preview-${PREVIEW_MAX}`;
+      const known = this.getFailure(filePath, stat);
+      if (known) {
+        return { success: false, error: this.toUserError({ message: known.error }, mediaInfo), cached: true, isRaw: mediaInfo.isRaw, full };
+      }
       const key = this.createCacheKey(filePath, stat, variant);
       const target = path.join(this.previewRoot, `${key}.jpg`);
       if (await fileExists(target)) {
@@ -596,10 +715,13 @@ class MediaService {
           source: result.source,
           full
         };
-      }).catch((error) => ({
-        success: false,
-        error: this.toUserError(error, mediaInfo)
-      })).finally(() => {
+      }).catch((error) => {
+        this.recordFailure(filePath, stat, error);
+        return {
+          success: false,
+          error: this.toUserError(error, mediaInfo)
+        };
+      }).finally(() => {
         this.previewInflight.delete(key);
       });
 
@@ -627,7 +749,12 @@ class MediaService {
   }
 
   createCacheKey(filePath, stat, variant) {
-    const signature = `${CACHE_VERSION}|${filePath}|${stat.size}|${Math.floor(stat.mtimeMs)}|${variant}`;
+    // Windows 文件系统大小写不敏感，同一个文件可能以 C:\A 和 c:\a 两种写法进来，
+    // 不归一化会给同一张图生成两份缩略图（且永远命中不了对方的缓存）。
+    const normalizedPath = process.platform === 'win32'
+      ? path.resolve(filePath).toLowerCase()
+      : filePath;
+    const signature = `${CACHE_VERSION}|${normalizedPath}|${stat.size}|${Math.floor(stat.mtimeMs)}|${variant}`;
     return crypto.createHash('sha256').update(signature).digest('hex');
   }
 
@@ -751,24 +878,37 @@ class MediaService {
       const stat = await fsp.stat(filePath);
       const signature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
       const key = `${filePath}|${signature}`;
-      if (this.rawOrientationCache.has(key)) return this.rawOrientationCache.get(key);
+      if (this.rawOrientationCache.has(key)) {
+        // Map 保持插入序：命中后先删再插，把该条挪到队尾，实现真正的 LRU。
+        const hit = this.rawOrientationCache.get(key);
+        this.rawOrientationCache.delete(key);
+        this.rawOrientationCache.set(key, hit);
+        return hit;
+      }
       // 目录扫描通常已经读过一次 EXIF，能命中就省掉一次 ExifTool 子进程往返。
       const cached = this.metadataCache.get(filePath, signature);
       if (cached && cached.orientation) {
-        const orientation = Orientation.normalize(cached.orientation);
-        this.rawOrientationCache.set(key, orientation);
-        return orientation;
+        return this.rememberSourceOrientation(key, Orientation.normalize(cached.orientation));
       }
       const tags = await this.exiftool.readRaw(filePath, ['-Orientation']);
-      const orientation = Orientation.normalize(tags && tags.Orientation);
-      this.rawOrientationCache.set(key, orientation);
-      if (this.rawOrientationCache.size > 200) {
-        this.rawOrientationCache.delete(this.rawOrientationCache.keys().next().value);
-      }
-      return orientation;
+      return this.rememberSourceOrientation(key, Orientation.normalize(tags && tags.Orientation));
     } catch (_) {
       return 1;
     }
+  }
+
+  /**
+   * 写入 RAW 方向缓存并维持 200 条上限；淘汰的是最久未被使用的条目。
+   */
+  rememberSourceOrientation(key, orientation) {
+    this.rawOrientationCache.delete(key);
+    this.rawOrientationCache.set(key, orientation);
+    while (this.rawOrientationCache.size > 200) {
+      const oldest = this.rawOrientationCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.rawOrientationCache.delete(oldest);
+    }
+    return orientation;
   }
 
   async commitTemporaryFile(source, target) {
@@ -791,13 +931,91 @@ class MediaService {
   }
 
   async loadFavorites() {
+    let raw;
     try {
-      const raw = await fsp.readFile(this.favoritesFile, 'utf8');
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) this.favorites = new Set(parsed.filter((item) => typeof item === 'string'));
-    } catch (_) {
+      raw = await fsp.readFile(this.favoritesFile, 'utf8');
+    } catch (error) {
+      // 首次运行没有该文件是正常的；只有「存在但读不了」才算可疑。
       this.favorites = new Set();
+      this.favoritesLoadedCleanly = !error || error.code === 'ENOENT';
+      return;
     }
+
+    try {
+      const parsed = JSON.parse(raw);
+      if (!Array.isArray(parsed)) throw new Error('favorites.json 不是字符串数组');
+      this.favorites = new Set(parsed.filter((item) => typeof item === 'string'));
+      this.favoritesLoadedCleanly = true;
+    } catch (error) {
+      // 关键：绝不能拿空 Set 当真相，下一次任何收藏操作都会把用户的收藏覆盖成 []。
+      // 先备份坏文件保留现场，再以「脏」状态启动，saveFavorites() 会改走 recovered 文件。
+      this.favorites = new Set();
+      this.favoritesLoadedCleanly = false;
+      const backup = `${this.favoritesFile}.corrupt-${Date.now()}`;
+      try {
+        await fsp.rename(this.favoritesFile, backup);
+        console.warn(`[mediew] favorites.json 解析失败（${error.message}），已备份为 ${path.basename(backup)}，本次会话不会覆写收藏。`);
+      } catch (_) {
+        console.warn(`[mediew] favorites.json 解析失败（${error.message}），且备份失败，本次会话不会覆写收藏。`);
+      }
+    }
+  }
+
+  /**
+   * 收藏路径迁移：供移动/重命名目录后把旧路径的收藏搬到新路径。
+   * pairs 形如 [[oldPath, newPath], ...]；返回实际变更条数。
+   */
+  remapFavoritePaths(pairs) {
+    const list = Array.isArray(pairs) ? pairs : [];
+    let changed = 0;
+    for (const pair of list) {
+      if (!Array.isArray(pair) || pair.length < 2) continue;
+      const [oldPath, newPath] = pair;
+      if (typeof oldPath !== 'string' || typeof newPath !== 'string') continue;
+      if (!this.favorites.has(oldPath)) continue;
+      this.favorites.delete(oldPath);
+      if (oldPath !== newPath) this.favorites.add(newPath);
+      changed += 1;
+    }
+    if (changed > 0) this.scheduleFavoriteSave();
+    return { success: true, changed };
+  }
+
+  /**
+   * 批量删除收藏（文件被移出媒体库/删除时调用）。
+   */
+  forgetFavoritePaths(paths) {
+    const list = Array.isArray(paths) ? paths : [];
+    let changed = 0;
+    for (const item of list) {
+      if (typeof item !== 'string') continue;
+      if (this.favorites.delete(item)) changed += 1;
+    }
+    if (changed > 0) this.scheduleFavoriteSave();
+    return { success: true, changed };
+  }
+
+  /**
+   * 删除某目录及其所有子路径下的收藏。Windows 上大小写不敏感，
+   * 且前缀必须以路径分隔符收边，避免 /a/photo 误伤 /a/photo2。
+   */
+  forgetFavoritesUnder(dirPath) {
+    if (typeof dirPath !== 'string' || dirPath.length === 0) {
+      return { success: true, changed: 0 };
+    }
+    const caseInsensitive = process.platform === 'win32';
+    const prefix = (caseInsensitive ? path.resolve(dirPath).toLowerCase() : path.resolve(dirPath))
+      + path.sep;
+    let changed = 0;
+    for (const item of Array.from(this.favorites)) {
+      const candidate = caseInsensitive ? item.toLowerCase() : item;
+      if (candidate === prefix.slice(0, -1) || candidate.startsWith(prefix)) {
+        this.favorites.delete(item);
+        changed += 1;
+      }
+    }
+    if (changed > 0) this.scheduleFavoriteSave();
+    return { success: true, changed };
   }
 
   /**
@@ -830,11 +1048,23 @@ class MediaService {
       clearTimeout(this.favoriteSaveTimer);
       this.favoriteSaveTimer = null;
     }
-    const tempFile = `${this.favoritesFile}.${process.pid}.tmp`;
+    // favorites.json 在启动时解析失败过：此时内存里是空 Set，写回就等同于清空用户收藏。
+    // 改为另存为 recovered 文件（本次会话固定同一个文件名，避免反复收藏写出 N 份），
+    // 把用户的坏文件原样留着等人工恢复。
+    if (!this.favoritesLoadedCleanly && !this.favoritesRecoveryFile) {
+      this.favoritesRecoveryFile = `${this.favoritesFile}.recovered-${Date.now()}`;
+    }
+    const target = this.favoritesLoadedCleanly
+      ? this.favoritesFile
+      : this.favoritesRecoveryFile;
+    const tempFile = `${target}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
     try {
-      await fsp.mkdir(path.dirname(this.favoritesFile), { recursive: true });
+      await fsp.mkdir(path.dirname(target), { recursive: true });
       await fsp.writeFile(tempFile, JSON.stringify(Array.from(this.favorites)), 'utf8');
-      await fsp.rename(tempFile, this.favoritesFile);
+      await fsp.rename(tempFile, target);
+      if (!this.favoritesLoadedCleanly) {
+        console.warn(`[mediew] 收藏文件处于损坏恢复态，已另存为 ${path.basename(target)}。`);
+      }
     } catch (_) {
       await safeUnlink(tempFile);
     }
@@ -842,9 +1072,26 @@ class MediaService {
 
   /**
    * 释放子进程和缓存资源。Electron 退出前必须等待该方法完成。
+   * 必须先把在途的 EXIF/宽高比 enrich 等完，否则它们在 flush 之后才写缓存，退出即丢。
    */
   async dispose() {
+    // 先进入「排空」状态再取消：这样取消标记只停止推送给渲染层，
+    // 已经排队但还没开始的 enrich 仍会把结果写进缓存（不会白跑一次 EXIF）。
+    this.drainingForExit = true;
     this.cancelActiveScan();
+
+    // 在途 enrich 最多再多等这么久，避免个别文件卡死导致应用永远退不出去。
+    if (this.pendingEnrich.size > 0) {
+      const pending = Array.from(this.pendingEnrich);
+      await Promise.race([
+        Promise.allSettled(pending),
+        new Promise((resolve) => {
+          const timer = setTimeout(resolve, DISPOSE_ENRICH_TIMEOUT_MS);
+          if (timer.unref) timer.unref();
+        })
+      ]);
+    }
+
     await Promise.allSettled([
       this.metadataCache.flush(),
       this.dimensionCache.flush(),

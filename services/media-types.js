@@ -1,10 +1,18 @@
 'use strict';
 
 // 标准图片扩展名：Chromium 或 sharp 通常可以直接解码。
+//
+// 这里只收录「当前打包的 sharp 真的能解码」的格式，避免用户看到永远破图的条目：
+// - .bmp 需要 libvips 编译时带 magick（本项目的预编译产物没有），sharp 会报
+//   "Input file contains unsupported image format"，且 sharp 完全读不出宽高，
+//   瀑布流连占位比例都拿不到。因此移出支持列表。
+// - .heic / .heif 需要 libheif 支持；sharp 0.35 的 heif 解码器只声明 .avif 后缀
+//   （input.fileSuffix === ['.avif']），按路径打开真实 HEIC 必然失败。同样移出。
+// - .avif 保留：走的就是 heif 解码器 + .avif 后缀，实测可解。
 const STANDARD_IMAGE_EXTENSIONS = new Set([
   '.jpg', '.jpeg', '.jpe', '.jfif',
-  '.png', '.gif', '.webp', '.bmp',
-  '.tif', '.tiff', '.avif', '.heic', '.heif'
+  '.png', '.gif', '.webp',
+  '.tif', '.tiff', '.avif'
 ]);
 
 // 相机 RAW 扩展名：这里采用常见相机厂商格式集合。

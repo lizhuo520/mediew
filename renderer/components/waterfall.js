@@ -29,6 +29,8 @@ const Waterfall = {
   _cardByPath: new Map(),
   _thumbnailFailed: 0,
   _thumbnailFailedNames: [],
+  // 目录读取失败时的错误文案；为空表示上一次读取是成功的。
+  _loadError: null,
 
   zoomLevel: 1.0,
   ZOOM_MIN: 0.3,
@@ -77,7 +79,11 @@ const Waterfall = {
   // 这里给它们 listbox/option 语义 + roving tabindex。
   applyCardAccessibility(card, imageInfo) {
     card.setAttribute('role', 'option');
-    card.setAttribute('aria-selected', 'false');
+    // 卡片是新建的 DOM，但"选中"是跨重建存在的模型状态：重建/滚动到新批次时
+    // 不在这里恢复，界面就会出现"看着没选、Delete 却批量删"。
+    const isSelected = this.selectedPaths.has(imageInfo.path);
+    card.setAttribute('aria-selected', isSelected ? 'true' : 'false');
+    if (isSelected) card.classList.add('selected');
     card.tabIndex = -1;
     const label = imageInfo.relativePath || imageInfo.name || this.getBasename(imageInfo.path);
     card.setAttribute('aria-label', label);
@@ -542,9 +548,13 @@ const Waterfall = {
       segment = [];
     };
 
+    // 分三段而不是边写边读：先只给分隔块写定位样式，再统一量高度，最后统一写坐标。
+    // 原实现在同一个循环里 style.top = ... 之后立刻读 child.offsetHeight，
+    // 每遇到一个日期标题就强制同步重排一次（大目录几十个分组 = 几十次 layout）。
+    const blocks = [];
     Array.from(this.grid.children).forEach((child) => {
       if (child.classList.contains('image-card')) {
-        segment.push(child);
+        blocks.push({ kind: 'card', node: child });
         return;
       }
       if (
@@ -552,16 +562,30 @@ const Waterfall = {
         child.classList.contains('load-more-sentinel') ||
         child.classList.contains('grid-loading')
       ) {
-        flushSegment();
         child.style.position = 'absolute';
         child.style.left = `${Math.round(metrics.paddingLeft)}px`;
-        child.style.top = `${Math.round(top)}px`;
         child.style.width = `${Math.round(availableWidth)}px`;
         child.style.height = 'auto';
         child.style.margin = '0';
-        const height = child.offsetHeight || 0;
-        top += height + metrics.gap;
+        blocks.push({ kind: 'block', node: child });
       }
+    });
+
+    // 只读阶段：此时所有分隔块的宽度已经生效，高度是最终值。
+    const blockHeights = new Map();
+    blocks.forEach((entry) => {
+      if (entry.kind === 'block') blockHeights.set(entry.node, entry.node.offsetHeight || 0);
+    });
+
+    // 只写阶段：用上面量到的高度推进 top。
+    blocks.forEach((entry) => {
+      if (entry.kind === 'card') {
+        segment.push(entry.node);
+        return;
+      }
+      flushSegment();
+      entry.node.style.top = `${Math.round(top)}px`;
+      top += (blockHeights.get(entry.node) || 0) + metrics.gap;
     });
     flushSegment();
 
@@ -575,6 +599,24 @@ const Waterfall = {
     const card = this.grid.querySelector(`.image-card[data-path="${CSS.escape(path)}"]`);
     if (card) this._cardByPath.set(path, card);
     return card;
+  },
+
+  /**
+   * 把 selectedPaths 里的状态重新贴回当前 DOM。
+   * 卡片 DOM 会被 applyFilters/rebuildView/removeCards 整体重建，但选中集合是模型状态；
+   * 重建后不重新上色，界面就与「已选 N」及 Delete 的实际行为脱节。
+   */
+  restoreSelectionVisuals() {
+    if (!this.grid) return;
+    let restored = 0;
+    this.selectedPaths.forEach((path) => {
+      const card = this.getCardByPath(path);
+      if (!card) return;
+      card.classList.add('selected');
+      card.setAttribute('aria-selected', 'true');
+      restored += 1;
+    });
+    return restored;
   },
 
   applyGridZoom(containerWidth) {
@@ -747,6 +789,7 @@ const Waterfall = {
     this._scanId = null;
     this._scanProgress = null;
     this._metadataDirty = false;
+    this._loadError = null;
     this._scanBuffers.clear();
     this._thumbnailFailed = 0;
     this._thumbnailFailedNames = [];
@@ -757,6 +800,18 @@ const Waterfall = {
     const recursive = SettingsManager.getRecursiveMode();
     const result = await window.api.readDirectory(dirPath, sortMode, sortDir, recursive);
     if (generation !== this._generation) return;
+
+    // 主进程把异常降级成 { items: [], error } 返回（main.js 的 catch 分支）。
+    // 不读 error 的话权限不足/盘符掉线会伪装成"该目录下没有媒体文件"。
+    if (result && result.error) {
+      this._loadError = result.error;
+      this._scanId = null;
+      this.allImages = [];
+      this._allImageByPath = new Map();
+      this.applyFilters({ resetScroll: true });
+      Toast.error(`读取目录失败：${result.error}`);
+      return;
+    }
 
     this._scanId = result.scanId || null;
     this.allImages = Array.isArray(result.items) ? result.items : [];
@@ -910,6 +965,8 @@ const Waterfall = {
     this._renderPlan = this.buildRenderPlan(this.imageList);
     this._renderIndex = 0;
     this.appendNextBatch(previousCards);
+    // 卡片是新建的，选中态得从 selectedPaths 重新贴回去（createImageCard 只覆盖新卡片）。
+    this.restoreSelectionVisuals();
     this.applyZoom();
     if (preserveScroll) this.container.scrollTop = previousScroll;
     if (resetScroll) this.container.scrollTop = 0;
@@ -944,6 +1001,28 @@ const Waterfall = {
    */
   appendNextBatch(minimumCards = 0) {
     if (!this._renderPlan.length) {
+      if (this._loadError) {
+        // 读取失败和"目录是空的"是两件事：前者要能重试，文案也不能说"没有媒体文件"。
+        this.grid.innerHTML = `
+          <div class="empty-state error-state">
+            <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor">
+              <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/>
+            </svg>
+            <span>目录读取失败，按 F5 重试</span>
+            <button type="button" class="empty-state-retry" data-action="retry-load">重试</button>
+          </div>`;
+        const retry = this.grid.querySelector('[data-action="retry-load"]');
+        if (retry) {
+          retry.addEventListener('click', () => {
+            if (window.App && typeof App.loadImagesForCurrentPreview === 'function') {
+              App.loadImagesForCurrentPreview();
+            }
+          });
+          retry.focus();
+        }
+        this.updateStats();
+        return;
+      }
       this.grid.innerHTML = `
         <div class="empty-state">
           <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor">
@@ -1283,8 +1362,14 @@ const Waterfall = {
     this.allImages = this.allImages.filter((item) => !pathSet.has(item.path));
     this.imageList = this.imageList.filter((item) => !pathSet.has(item.path));
     this._allImageByPath = new Map(this.allImages.map((item) => [item.path, item]));
-    this.clearSelection();
+    // 以前这里直接 clearSelection()：删 3 张会把另外 20 张的选中也一并清掉。
+    // 只摘掉被删除的那些，剩下的选中交给 restoreSelectionVisuals 重新上色。
+    pathSet.forEach((path) => this.selectedPaths.delete(path));
+    // imageList 变了，索引映射必须跟着重建：appendNextBatch 用它给卡片算 index，
+    // 留旧 Map 会让点击卡片打开 imageList 里错位的那张（删一张就整体错一位）。
+    this._imageIndexMap = new Map(this.imageList.map((item, index) => [item.path, index]));
     this.rebuildView({ preserveScroll: true });
+    this.restoreSelectionVisuals();
   },
 
   toggleFavoriteCard(imageInfo, favorite) {
@@ -1311,12 +1396,27 @@ const Waterfall = {
     parts.push(`显示 ${shown} / ${total}`);
     if (rawCount) parts.push(`RAW ${rawCount}`);
     if (typeof SettingsManager !== 'undefined' && SettingsManager.getRecursiveMode()) parts.push('递归');
-    if (this.selectedPaths.size) parts.push(`已选 ${this.selectedPaths.size}`);
+    // 只统计仍然存在的文件：删除/移走之后 selectedPaths 里可能还留着幽灵路径，
+    // 直接报 size 会让「已选 N」比屏幕上能看到的选中卡片还多。
+    const liveSelected = this.countLiveSelection();
+    if (liveSelected) parts.push(`已选 ${liveSelected}`);
     let text = parts.join(' · ');
     // 失败也必须显式可见，否则空白卡片会被误认为「这张图就是这样」。
     if (this._thumbnailFailed > 0) text += `（${this._thumbnailFailed} 张缩略图失败）`;
     this._statsElement.textContent = text;
     this._statsElement.title = this._thumbnailFailed > 0 ? this._thumbnailFailedNames.join('\n') : '';
+  },
+
+  /**
+   * selectedPaths 里仍然存在于当前目录的条目数（不改变选中集合本身）。
+   */
+  countLiveSelection() {
+    if (!this.selectedPaths.size) return 0;
+    let count = 0;
+    this.selectedPaths.forEach((path) => {
+      if (this._allImageByPath.has(path)) count += 1;
+    });
+    return count;
   },
 
   startRenameCard(imageInfo) {
@@ -1369,6 +1469,40 @@ const Waterfall = {
       if (event.key === 'Enter') { event.preventDefault(); input.blur(); }
       if (event.key === 'Escape') { input.value = imageInfo.name.replace(/\.[^.]+$/, ''); input.blur(); }
     });
+  },
+
+  /**
+   * 把瀑布流退回"没有目录"的状态。
+   * 删除/移走当前根目录时必须走这里：只清 #image-grid 的 DOM 会留下
+   * allImages/selectedPaths/_cardByPath，下一次任何 rebuild 都会把已删除
+   * 目录的内容重新渲染出来，选中集合也会指向已经不存在的文件。
+   */
+  reset() {
+    this._generation += 1;
+    this.currentDirectory = null;
+    this._scanId = null;
+    this._scanProgress = null;
+    this._loadError = null;
+    this._metadataDirty = false;
+    this._scanBuffers.clear();
+    this.allImages = [];
+    this.imageList = [];
+    this._allImageByPath = new Map();
+    this._imageIndexMap = new Map();
+    this._renderPlan = [];
+    this._renderIndex = 0;
+    this._keyboardIndex = -1;
+    this.lastClickedIndex = -1;
+    this._thumbnailFailed = 0;
+    this._thumbnailFailedNames = [];
+    this.selectedPaths.clear();
+    this.disconnectRenderObservers();
+    if (this.grid) {
+      this.grid.innerHTML = '';
+      this.grid.style.height = '';
+    }
+    if (this.container) this.container.scrollTop = 0;
+    this.updateStats();
   }
 };
 

@@ -780,6 +780,37 @@ body {
   opacity: 0.5;
 }
 
+/* 读取失败不是"空目录"：图标和文字要能看出是出错了，并给一个重试入口。 */
+.empty-state.error-state {
+  color: var(--text-secondary);
+}
+
+.empty-state.error-state svg {
+  color: var(--danger);
+  opacity: 0.85;
+}
+
+.empty-state-retry {
+  margin-top: 14px;
+  padding: 6px 18px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-card);
+  color: var(--text-primary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.empty-state-retry:hover {
+  background: var(--hover-bg);
+  border-color: var(--accent-blue);
+}
+
+.empty-state-retry:focus-visible {
+  outline: 2px solid var(--accent-blue);
+  outline-offset: 2px;
+}
+
 /* Responsive columns：列数由 Waterfall.applyWaterfallZoom() 按缩放级别写内联样式，
    这里只处理侧栏宽度，不再用 column-count（已改为 Grid masonry）。 */
 @media (max-width: 800px) {

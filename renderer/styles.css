@@ -565,12 +565,18 @@ body {
 }
 
 /* 灯箱用两个图层交替：新图先在自己的图层里解码，完成后与旧图交叉淡化。
-   绝对定位 + inset:0 + margin:auto 让原尺寸图片仍然居中，
-   transform 依旧只负责缩放/平移，两者互不干扰。 */
+   图层是 <img>，布局盒等于图片原始像素尺寸（往往是 6000×4000，远大于容器），
+   所以不能用 inset:0 + margin:auto 居中：内在尺寸超出包含块时 auto 边距无法变负，
+   浏览器会解析成「左边距固定、右边距大负值」，图片被整体推到容器右边之外。
+   改用 left/top:50% + 独立的 translate:-50% -50% 按自身尺寸精确回退半个盒子，
+   它与 transform（缩放/平移/旋转）是两个互不干扰的属性。 */
 .preview-image-layer {
   position: absolute;
-  inset: 0;
-  margin: auto;
+  inset: auto;
+  left: 50%;
+  top: 50%;
+  margin: 0;
+  translate: -50% -50%;
   object-fit: contain;
   image-orientation: from-image;
   transform-origin: center center;

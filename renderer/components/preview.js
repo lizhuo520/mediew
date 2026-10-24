@@ -581,13 +581,13 @@ const Preview = {
     const oldScale = this.scale;
     this.scale = Math.max(0.05, Math.min(this.maxScale * 2, target));
 
-    const { w: vW, h: vH } = this.getViewSize();
-    const cx = vW / 2;
-    const cy = vH / 2;
-
     if (oldScale > 0) {
-      this.panX = cx - (cx - this.panX) * this.scale / oldScale;
-      this.panY = cy - (cy - this.panY) * this.scale / oldScale;
+      // panX/panY 是「图片中心相对视口中心」的偏移，视口中心在平移坐标系里就是原点 (0,0)。
+      // 以中心为锚点缩放时，中心点的内容位置不变，偏移按同比例放大即可。
+      // （此前误把容器绝对坐标 vW/2 当成锚点传入，每次缩放都会横向漂移 vW/2。）
+      const ratio = this.scale / oldScale;
+      this.panX *= ratio;
+      this.panY *= ratio;
     }
 
     this.clampPan();

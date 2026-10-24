@@ -33,6 +33,24 @@ test('灯箱有两个图片图层并支持交叉淡化', () => {
   assert.match(preview, /onImageReady\(incoming, outgoing/);
 });
 
+test('灯箱图层按自身尺寸精确居中，不用会失效的 auto 边距', () => {
+  const layer = css.match(/\.preview-image-layer\s*\{[^}]*\}/);
+  assert.ok(layer, '应有 .preview-image-layer 规则');
+  // inset:0 + margin:auto 在内在尺寸大于容器时无法居中，会把图片推出可视区。
+  assert.doesNotMatch(layer[0], /margin:\s*auto/);
+  assert.match(layer[0], /left:\s*50%/);
+  assert.match(layer[0], /top:\s*50%/);
+  assert.match(layer[0], /translate:\s*-50%\s+-50%/);
+});
+
+test('缩放以视口中心为锚点，平移量按比例缩放而不是偏移半个视口', () => {
+  const zoom = preview.match(/zoomTo\(target, animate\)\s*\{[\s\S]*?\n  \},/);
+  assert.ok(zoom, '应能找到 zoomTo');
+  assert.match(zoom[0], /this\.panX \*= ratio/);
+  assert.match(zoom[0], /this\.panY \*= ratio/);
+  assert.doesNotMatch(zoom[0], /cx - \(cx - this\.panX\)/);
+});
+
 test('系统开启减少动态效果时关闭灯箱过渡', () => {
   const reduced = css.match(/@media \(prefers-reduced-motion: reduce\)\s*\{[\s\S]*?\n\}/);
   assert.ok(reduced, '应有 prefers-reduced-motion 规则');

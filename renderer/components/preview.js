@@ -52,6 +52,7 @@ const Preview = {
     this._layerA = document.getElementById('preview-image');
     this._layerB = document.getElementById('preview-image-alt');
     this.image = this._layerA;
+    this._appliedAngle = null;
     this.imageAlt = this._layerB;
     this.video = document.getElementById('preview-video');
     this.imageArea = document.querySelector('.preview-image-area');
@@ -546,10 +547,27 @@ const Preview = {
       this.image.style.transition = 'transform 0s, opacity 0.22s ease';
     }
 
-    const angle = MediewOrientation.normalizeAngle(this.rotation);
+    const angle = this.nextAppliedAngle();
     this.image.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.scale}) rotate(${angle}deg)`;
 
     this.container.classList.toggle('zoomed', this.scale > this.fitScale + 0.01);
+  },
+
+  /**
+   * 施加给图层的旋转角度要连续累加，不能直接归一化到 0..359。
+   * CSS 过渡插值的是旋转矩阵：270° 之后目标若是 0°，浏览器会按 -270° 反向转回去，
+   * 看起来就是「第四次旋转倒着转了 270 度」。这里按最短方向累加，
+   * 0→90→180→270→360 一路正向，反向旋转则累减成 -90。
+   */
+  nextAppliedAngle() {
+    const target = MediewOrientation.normalizeAngle(this.rotation);
+    if (typeof this._appliedAngle !== 'number') {
+      this._appliedAngle = target;
+      return target;
+    }
+    const delta = (((target - this._appliedAngle) % 360) + 360) % 360;
+    this._appliedAngle += delta > 180 ? delta - 360 : delta;
+    return this._appliedAngle;
   },
 
   /**
@@ -615,6 +633,7 @@ const Preview = {
       layer.style.transition = 'none';
     });
     this.image = this._layerA;
+    this._appliedAngle = null;
     this.imageAlt = this._layerB;
     this.standbyImage = this._layerB;
   },
@@ -707,6 +726,7 @@ const Preview = {
         layer.style.display = 'none';
       });
       this.image = this._layerA;
+      this._appliedAngle = null;
       this.standbyImage = this._layerB;
       this.video.style.display = 'block';
       this.container.classList.add('video-mode');
@@ -813,6 +833,7 @@ const Preview = {
     this._originalLoading = false;
     this._showingOriginal = Boolean(options.original);
     this.image = incoming;
+    this._appliedAngle = null;
     this.standbyImage = incoming === this._layerA ? this._layerB : this._layerA;
     this.calcScales();
     this.scale = this._showingOriginal ? this.getPixelScale() : this.fitScale;

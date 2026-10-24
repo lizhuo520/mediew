@@ -99,6 +99,20 @@ test('只有 5~8 交换显示宽高', () => {
   assert.equal(Orientation.swapsDimensions('Rotate 180'), false);
 });
 
+test('手动旋转角度归一化到 0/90/180/270，并按 90/270 交换显示尺寸', () => {
+  assert.equal(Orientation.normalizeAngle(90), 90);
+  assert.equal(Orientation.normalizeAngle(-90), 270);
+  assert.equal(Orientation.normalizeAngle(450), 90);
+  assert.equal(Orientation.normalizeAngle(720), 0);
+  assert.equal(Orientation.normalizeAngle('180'), 180);
+  assert.equal(Orientation.normalizeAngle(Number.NaN), 0);
+
+  assert.deepEqual(Orientation.rotatedSize(1200, 1800, 0), { width: 1200, height: 1800 });
+  assert.deepEqual(Orientation.rotatedSize(1200, 1800, 90), { width: 1800, height: 1200 });
+  assert.deepEqual(Orientation.rotatedSize(1200, 1800, 180), { width: 1200, height: 1800 });
+  assert.deepEqual(Orientation.rotatedSize(1200, 1800, 270), { width: 1800, height: 1200 });
+});
+
 test('RAW 内嵌预览缺失方向标签时可用源方向补正', async () => {
   // 先生成一张 2x3 的无方向 PNG，再以 orientation=6 显式旋转，等价于
   // “内嵌 JPEG 没有 EXIF、主文件 RAW 有 Orientation=6”的场景。

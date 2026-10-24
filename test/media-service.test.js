@@ -168,6 +168,39 @@ test('TIFF 可生成 640 缩略图、缓存预览并探测到宽高比', async (
   }
 });
 
+test('查看原图会生成全分辨率预览，而默认预览仍限制在 4096', async () => {
+  const mediaDir = await makeTempDirectory('mediew-fullpreview-');
+  const userDataDir = await makeTempDirectory('mediew-fullpreview-user-');
+  const service = new MediaService({ userDataPath: userDataDir });
+  await service.initialize();
+  try {
+    const file = path.join(mediaDir, 'large.tif');
+    await sharp({ create: { width: 6000, height: 2000, channels: 3, background: '#2a4d69' } })
+      .tiff()
+      .toFile(file);
+
+    const normal = await service.getPreview(file);
+    assert.equal(normal.success, true, normal.error);
+    const normalMeta = await sharp(fileURLToPath(normal.url)).metadata();
+    assert.equal(Math.max(normalMeta.width, normalMeta.height), 4096, '默认预览最长边应为 4096');
+
+    const full = await service.getPreview(file, { full: true });
+    assert.equal(full.success, true, full.error);
+    assert.equal(full.full, true);
+    const fullMeta = await sharp(fileURLToPath(full.url)).metadata();
+    assert.equal(fullMeta.width, 6000, '原图预览不应被缩到 4096');
+    assert.equal(fullMeta.height, 2000);
+
+    // 第二次请求命中 full 缓存，不再重新编码
+    const cached = await service.getPreview(file, { full: true });
+    assert.equal(cached.source, 'cache');
+  } finally {
+    await service.dispose();
+    await removeTempDirectory(mediaDir);
+    await removeTempDirectory(userDataDir);
+  }
+});
+
 test('宽高比探测结果会持久化，重启后二次扫描直接命中', async () => {
   const mediaDir = await makeTempDirectory('mediew-dimcache-');
   const userDataDir = await makeTempDirectory('mediew-dimcache-user-');

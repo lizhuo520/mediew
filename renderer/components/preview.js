@@ -23,6 +23,15 @@ const Preview = {
   _loadingText: null,
   _zoomIndicator: null,
   _zoomTimer: null,
+  _rotateLeftBtn: null,
+  _rotateRightBtn: null,
+  _originalBtn: null,
+  _rotationMap: null,
+  _showingOriginal: false,
+  _originalLoading: false,
+
+  rotation: 0,
+  ROTATION_KEY: 'Mediew-manual-rotation',
 
   scale: 1,
   fitScale: 1,
@@ -50,8 +59,25 @@ const Preview = {
     this._loadingEl = document.getElementById('preview-loading');
     this._loadingText = document.getElementById('preview-loading-text');
     this._zoomIndicator = document.getElementById('preview-zoom-indicator');
+    this._rotateLeftBtn = document.getElementById('preview-rotate-left');
+    this._rotateRightBtn = document.getElementById('preview-rotate-right');
+    this._originalBtn = document.getElementById('preview-original');
+    this.loadRotationStore();
 
     document.querySelector('.preview-close').addEventListener('click', () => this.close());
+
+    this._rotateLeftBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.rotateBy(-90);
+    });
+    this._rotateRightBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.rotateBy(90);
+    });
+    this._originalBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      this.toggleOriginal();
+    });
 
     this.imageArea.addEventListener('click', (e) => {
       if (e.target === this.imageArea || e.target === this.container) {
@@ -91,6 +117,7 @@ const Preview = {
     });
 
     this.initVideoPlayer();
+    this.updateOriginalButton();
   },
 
   initVideoPlayer() {
@@ -219,6 +246,149 @@ const Preview = {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
   },
 
+  loadRotationStore() {
+    this._rotationMap = {};
+    try {
+      const parsed = JSON.parse(localStorage.getItem(this.ROTATION_KEY) || '{}');
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) this._rotationMap = parsed;
+    } catch (_) {
+      this._rotationMap = {};
+    }
+  },
+
+  getRotation(filePath) {
+    return MediewOrientation.normalizeAngle(this._rotationMap[filePath] || 0);
+  },
+
+  saveRotation(filePath, angle) {
+    const normalized = MediewOrientation.normalizeAngle(angle);
+    if (normalized === 0) {
+      delete this._rotationMap[filePath];
+    } else {
+      this._rotationMap[filePath] = normalized;
+    }
+    // 只保留最近 800 条，避免长年使用后 localStorage 无限膨胀。
+    const keys = Object.keys(this._rotationMap);
+    if (keys.length > 800) keys.slice(0, keys.length - 800).forEach((key) => delete this._rotationMap[key]);
+    try {
+      localStorage.setItem(this.ROTATION_KEY, JSON.stringify(this._rotationMap));
+    } catch (_) {}
+  },
+
+  rotateBy(delta) {
+    if (!this.isOpen || this.isVideo || this._originalLoading) return;
+    const img = this.imageList[this.currentIndex];
+    if (!img) return;
+
+    this.rotation = MediewOrientation.normalizeAngle(this.rotation + delta);
+    this.saveRotation(img.path, this.rotation);
+
+    // 正在看原图时保持 100%，适应窗口时按旋转后的尺寸重新适配。
+    const keepOriginal = this._showingOriginal;
+    this.calcScales();
+    this.scale = keepOriginal ? 1 : this.fitScale;
+    this.panX = 0;
+    this.panY = 0;
+    this.clampPan();
+    this.applyTransform(true);
+    this.updateInfo(img);
+    this.showZoomIndicator();
+  },
+
+  updateOriginalButton() {
+    if (!this._originalBtn) return;
+    const active = this._showingOriginal;
+    this._originalBtn.classList.toggle('active', active);
+    this._originalBtn.textContent = active ? '适应' : '原图';
+    this._originalBtn.title = active
+      ? '恢复到适应窗口 (O)'
+      : '查看原图（1:1 原始分辨率，O）';
+    this._originalBtn.disabled = this.isVideo || this._originalLoading;
+    if (this._rotateLeftBtn) this._rotateLeftBtn.disabled = this.isVideo;
+    if (this._rotateRightBtn) this._rotateRightBtn.disabled = this.isVideo;
+  },
+
+  async toggleOriginal() {
+    if (!this.isOpen || this.isVideo || this._originalLoading) return;
+    const img = this.imageList[this.currentIndex];
+    if (!img) return;
+
+    if (this._showingOriginal) {
+      this._showingOriginal = false;
+      this.calcScales();
+      this.scale = this.fitScale;
+      this.panX = 0;
+      this.panY = 0;
+      this.applyTransform(true);
+      this.updateOriginalButton();
+      return;
+    }
+
+    // 普通格式当前就是原图，直接切到 100%；RAW/TIFF/HEIC 需要主进程生成
+    // 全分辨率 JPEG（默认预览最长边只到 4096）。
+    if (this.needsGeneratedPreview(img) && this._fullPreviewPath !== img.path) {
+      await this.loadFullPreview(img);
+      return;
+    }
+
+    this._showingOriginal = true;
+    this.scale = 1;
+    this.panX = 0;
+    this.panY = 0;
+    this.clampPan();
+    this.applyTransform(true);
+    this.updateOriginalButton();
+    this.showZoomIndicator();
+  },
+
+  async loadFullPreview(img) {
+    const token = ++this._previewToken;
+    this._originalLoading = true;
+    this.updateOriginalButton();
+    this.showLoading('正在加载原图…');
+    document.getElementById('info-dimensions').textContent = '正在加载原图…';
+
+    const incoming = this.standbyImage;
+    const outgoing = this.image;
+    incoming.onload = null;
+    incoming.onerror = null;
+    incoming.classList.remove('loaded');
+    incoming.style.display = 'block';
+    incoming.style.opacity = '0';
+    incoming.style.transition = 'opacity 0.22s ease';
+
+    incoming.onload = () => {
+      if (token !== this._previewToken || !this.isOpen) return;
+      this._originalLoading = false;
+      this._fullPreviewPath = img.path;
+      this.onImageReady(incoming, outgoing, img, 0, { original: true });
+    };
+    incoming.onerror = () => {
+      if (token !== this._previewToken) return;
+      const srcAttr = incoming.getAttribute('src');
+      if (!srcAttr || srcAttr === 'about:blank') return;
+      this._originalLoading = false;
+      this.hideLoading();
+      this._showingOriginal = false;
+      this.updateOriginalButton();
+      if (outgoing && outgoing.classList.contains('loaded')) outgoing.style.opacity = '1';
+      Toast.error(`${img.name}：原图加载失败`);
+    };
+
+    const result = await window.api.getPreview(img.path, { full: true });
+    if (token !== this._previewToken || !this.isOpen) return;
+    if (!result.success) {
+      this._originalLoading = false;
+      this.hideLoading();
+      this._showingOriginal = false;
+      this.updateOriginalButton();
+      if (outgoing && outgoing.classList.contains('loaded')) outgoing.style.opacity = '1';
+      Toast.error(`${img.name}：${result.error || '原图不可用'}`);
+      return;
+    }
+    incoming.src = result.url;
+  },
+
   /**
    * 灯箱取图策略（对齐 gkpv）：
    * 浏览器能直接解码的格式一律加载原图，保留最高缩放质量；
@@ -237,21 +407,28 @@ const Preview = {
     return { w: window.innerWidth - panelW, h: window.innerHeight };
   },
 
+  getRotatedNaturalSize() {
+    return MediewOrientation.rotatedSize(
+      this.image.naturalWidth,
+      this.image.naturalHeight,
+      this.rotation
+    );
+  },
+
   calcScales() {
-    const nW = this.image.naturalWidth;
-    const nH = this.image.naturalHeight;
+    const { width: nW, height: nH } = this.getRotatedNaturalSize();
     if (!nW || !nH) return;
 
     const { w: vW, h: vH } = this.getViewSize();
 
     this.fitScale = Math.min(vW / nW, vH / nH);
     if (this.fitScale > 1) this.fitScale = 1;
-    this.maxScale = this.fitScale * 5;
+    // 允许「原图」切到 100%，即使高分辨率图的适配比例小于 1。
+    this.maxScale = Math.max(this.fitScale * 5, 1);
   },
 
   clampPan() {
-    const nW = this.image.naturalWidth;
-    const nH = this.image.naturalHeight;
+    const { width: nW, height: nH } = this.getRotatedNaturalSize();
     const displayW = nW * this.scale;
     const displayH = nH * this.scale;
     const { w: vW, h: vH } = this.getViewSize();
@@ -271,7 +448,8 @@ const Preview = {
       this.image.style.transition = 'transform 0s, opacity 0.22s ease';
     }
 
-    this.image.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.scale})`;
+    const angle = MediewOrientation.normalizeAngle(this.rotation);
+    this.image.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.scale}) rotate(${angle}deg)`;
 
     this.container.classList.toggle('zoomed', this.scale > this.fitScale + 0.01);
   },
@@ -349,6 +527,10 @@ const Preview = {
     this.panX = 0;
     this.panY = 0;
     this.scale = 1;
+    this.rotation = 0;
+    this._showingOriginal = false;
+    this._fullPreviewPath = null;
+    this._originalLoading = false;
     this.resetLayers();
     this.showImage(0, { immediate: true });
     this.modal.classList.add('active');
@@ -369,6 +551,12 @@ const Preview = {
     this.fitScale = 1;
     this.panX = 0;
     this.panY = 0;
+    this.rotation = 0;
+    this._showingOriginal = false;
+    this._fullPreviewPath = null;
+    this._originalLoading = false;
+    this.modal.classList.remove('video-active');
+    this.updateOriginalButton();
     for (const preload of this._preloadImages.values()) preload.src = '';
     this._preloadImages.clear();
   },
@@ -381,6 +569,12 @@ const Preview = {
     this.video.style.display = 'none';
     document.getElementById('video-controls').classList.remove('active');
     this.isVideo = img.type === 'video';
+    this.modal.classList.toggle('video-active', this.isVideo);
+    this.rotation = this.getRotation(img.path);
+    this._showingOriginal = false;
+    this._fullPreviewPath = null;
+    this._originalLoading = false;
+    this.updateOriginalButton();
 
     if (this.isVideo) {
       this.hideLoading();
@@ -432,7 +626,7 @@ const Preview = {
     incoming.style.display = 'block';
     incoming.style.opacity = '0';
     incoming.style.transition = 'transform 0.3s cubic-bezier(0.25, 0.1, 0.25, 1), opacity 0.22s ease';
-    incoming.style.transform = `translate(${direction * 22}px, 0px) scale(0.985)`;
+    incoming.style.transform = `translate(${direction * 22}px, 0px) scale(0.985) rotate(${this.rotation}deg)`;
 
     this.panX = 0;
     this.panY = 0;
@@ -478,14 +672,17 @@ const Preview = {
     }
   },
 
-  onImageReady(incoming, outgoing, img, direction) {
+  onImageReady(incoming, outgoing, img, direction, options = {}) {
     this.hideLoading();
+    this._originalLoading = false;
+    this._showingOriginal = Boolean(options.original);
     this.image = incoming;
     this.standbyImage = incoming === this._layerA ? this._layerB : this._layerA;
     this.calcScales();
-    this.scale = this.fitScale;
+    this.scale = this._showingOriginal ? 1 : this.fitScale;
     this.panX = 0;
     this.panY = 0;
+    if (this._showingOriginal && img) this._fullPreviewPath = img.path;
     incoming.classList.add('loaded');
     // 从 0.985 / 位移状态过渡到适配尺寸；方向只影响入场的一点点位移。
     void incoming.offsetWidth;
@@ -509,11 +706,15 @@ const Preview = {
     }
 
     if (img) {
-      const suffix = img.isRaw ? ' · RAW 预览' : '';
+      let suffix = img.isRaw ? ' · RAW 预览' : '';
+      if (this._showingOriginal) suffix += ' · 原图';
+      if (this.rotation) suffix += ` · 旋转 ${this.rotation}°`;
       const width = img.width > 0 ? img.width : incoming.naturalWidth;
       const height = img.height > 0 ? img.height : incoming.naturalHeight;
-      document.getElementById('info-dimensions').textContent = `${width} × ${height} px${suffix}`;
+      const display = MediewOrientation.rotatedSize(width, height, this.rotation);
+      document.getElementById('info-dimensions').textContent = `${display.width} × ${display.height} px${suffix}`;
       this.prefetchAdjacent();
+      this.updateOriginalButton();
     }
   },
 
@@ -550,7 +751,13 @@ const Preview = {
     filenameEl.textContent = img.name;
     filenameEl.title = img.relativePath || img.name;
     document.getElementById('info-folder').textContent = img.folder || '当前目录';
-    document.getElementById('info-dimensions').textContent = img.width && img.height ? `${img.width} × ${img.height} px` : '加载中...';
+    if (img.width && img.height) {
+      const display = MediewOrientation.rotatedSize(img.width, img.height, this.rotation);
+      const rotationSuffix = this.rotation ? ` · 旋转 ${this.rotation}°` : '';
+      document.getElementById('info-dimensions').textContent = `${display.width} × ${display.height} px${rotationSuffix}`;
+    } else {
+      document.getElementById('info-dimensions').textContent = '加载中...';
+    }
     document.getElementById('info-filesize').textContent = this.formatSize(img.size);
     document.getElementById('info-date').textContent = img.date || '未知日期';
     document.getElementById('info-camera').textContent = img.camera || '-';
@@ -692,6 +899,17 @@ const Preview = {
           this.togglePlay();
           break;
       }
+      return;
+    }
+
+    if ((e.key === 'r' || e.key === 'R') && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      this.rotateBy(e.shiftKey ? -90 : 90);
+      return;
+    }
+    if ((e.key === 'o' || e.key === 'O') && !e.ctrlKey && !e.metaKey) {
+      e.preventDefault();
+      this.toggleOriginal();
       return;
     }
 

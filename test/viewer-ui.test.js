@@ -38,6 +38,21 @@ test('系统开启减少动态效果时关闭灯箱过渡', () => {
   assert.ok(reduced, '应有 prefers-reduced-motion 规则');
 });
 
+test('灯箱提供手动旋转与查看原图入口', () => {
+  assert.match(html, /id="preview-rotate-left"/);
+  assert.match(html, /id="preview-rotate-right"/);
+  assert.match(html, /id="preview-original"/);
+  assert.match(preview, /rotateBy\(/);
+  assert.match(preview, /toggleOriginal\(/);
+  assert.match(preview, /getPreview\(img\.path, \{ full: true \}\)/);
+  assert.match(css, /\.preview-toolbar/);
+});
+
+test('卡片不再渲染左上角格式角标', () => {
+  assert.doesNotMatch(waterfall, /class = 'format-badge/);
+  assert.doesNotMatch(css, /\.format-badge\s*\{/);
+});
+
 test('方向工具与瀑布流工具在页面脚本中先于组件加载', () => {
   const orientationIndex = html.indexOf('utils/orientation.js');
   const masonryIndex = html.indexOf('utils/masonry.js');

@@ -157,7 +157,34 @@ async function run() {
       };
       await wait(650);
       const layers = Array.from(document.querySelectorAll('.preview-image-layer'));
+
+      Preview.rotateBy(90);
+      await wait(360);
+      const rotated = {
+        rotation: Preview.rotation,
+        transform: Preview.image.style.transform,
+        dimensions: document.getElementById('info-dimensions').textContent
+      };
+
+      await Preview.toggleOriginal();
+      await wait(600);
+      const original = {
+        showing: Preview._showingOriginal,
+        scale: Preview.scale,
+        buttonText: document.getElementById('preview-original').textContent,
+        buttonActive: document.getElementById('preview-original').classList.contains('active'),
+        fullRequests: window.api.getPreviewFullRequests().length
+      };
+
+      // 还原到适应窗口 / 0°，截图保持常规预览状态
+      await Preview.toggleOriginal();
+      await wait(360);
+      Preview.rotateBy(-90);
+      await wait(360);
+
       return {
+        rotated,
+        original,
         firstLayer,
         firstTransition,
         firstCounter,

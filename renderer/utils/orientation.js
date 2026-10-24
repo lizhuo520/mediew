@@ -45,6 +45,27 @@ const Orientation = {
   },
 
   /**
+   * 手动旋转角度归一化到 0/90/180/270。
+   */
+  normalizeAngle(value) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return 0;
+    return ((Math.round(numeric / 90) * 90) % 360 + 360) % 360;
+  },
+
+  /**
+   * 旋转后的显示尺寸（90/270 交换宽高）。
+   */
+  rotatedSize(width, height, angle) {
+    const w = Number(width) || 0;
+    const h = Number(height) || 0;
+    const normalized = this.normalizeAngle(angle);
+    return normalized === 90 || normalized === 270
+      ? { width: h, height: w }
+      : { width: w, height: h };
+  },
+
+  /**
    * 给没有携带 EXIF 的像素源显式应用方向（典型场景：RAW 内嵌 JPEG）。
    * 有 EXIF 的输入仍应优先使用 sharp().rotate() 的自动定向。
    *

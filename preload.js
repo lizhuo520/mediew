@@ -20,7 +20,7 @@ contextBridge.exposeInMainWorld('api', {
   onMediaDimensionsComplete: (callback) => subscribe('media-dimensions-complete', callback),
 
   getThumbnail: (filePath, size) => ipcRenderer.invoke('get-thumbnail', filePath, size),
-  getPreview: (filePath) => ipcRenderer.invoke('get-preview', filePath),
+  getPreview: (filePath, options) => ipcRenderer.invoke('get-preview', filePath, options),
   preparePreview: (filePath) => ipcRenderer.invoke('prepare-preview', filePath),
 
   getSubfolders: (dirPath) => ipcRenderer.invoke('get-subfolders', dirPath),

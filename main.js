@@ -151,8 +151,8 @@ ipcMain.handle('get-thumbnail', async (event, filePath, size) => {
   return mediaService ? mediaService.getThumbnail(filePath, size) : { success: false, error: '服务尚未初始化' };
 });
 
-ipcMain.handle('get-preview', async (event, filePath) => {
-  return mediaService ? mediaService.getPreview(filePath) : { success: false, error: '服务尚未初始化' };
+ipcMain.handle('get-preview', async (event, filePath, options) => {
+  return mediaService ? mediaService.getPreview(filePath, options) : { success: false, error: '服务尚未初始化' };
 });
 
 ipcMain.handle('prepare-preview', async (event, filePath) => {

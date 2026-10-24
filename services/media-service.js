@@ -33,6 +33,10 @@ const THUMBNAIL_MAX = 640;
 const THUMBNAIL_QUALITY = 80;
 const PREVIEW_MAX = 4096;
 const PREVIEW_QUALITY = 92;
+// 「查看原图」用的全分辨率预览：不按 4096 缩，最长边上限放到 16384，
+// 避免极少数 100MP 以上的图把内存打爆；正常照片就是原始像素。
+const PREVIEW_FULL_MAX = 16384;
+const PREVIEW_FULL_QUALITY = 95;
 
 // 缓存内容版本号：缩略图/预览的语义变化时递增，旧条目会因为键变化而自动失效。
 const CACHE_VERSION = 'v3-orientation';
@@ -550,7 +554,7 @@ class MediaService {
    * 普通图片继续使用原图以保留最高缩放质量；
    * RAW、TIFF、HEIC 等浏览器不能稳定显示的格式改为生成缓存 JPEG。
    */
-  async getPreview(filePath) {
+  async getPreview(filePath, options = {}) {
     try {
       const stat = await fsp.stat(filePath);
       const mediaInfo = getMediaInfo(filePath);
@@ -564,24 +568,31 @@ class MediaService {
           success: true,
           url: pathToFileURL(filePath).href,
           isRaw: mediaInfo.isRaw,
-          source: 'original'
+          source: 'original',
+          full: true
         };
       }
 
-      const key = this.createCacheKey(filePath, stat, `preview-${PREVIEW_MAX}`);
+      const full = Boolean(options && options.full);
+      const maxSize = full ? PREVIEW_FULL_MAX : PREVIEW_MAX;
+      const quality = full ? PREVIEW_FULL_QUALITY : PREVIEW_QUALITY;
+      // 标准预览沿用旧缓存键，只有「原图」使用新的 full 键。
+      const variant = full ? `preview-full-${PREVIEW_FULL_MAX}` : `preview-${PREVIEW_MAX}`;
+      const key = this.createCacheKey(filePath, stat, variant);
       const target = path.join(this.previewRoot, `${key}.jpg`);
       if (await fileExists(target)) {
-        return { success: true, url: pathToFileURL(target).href, isRaw: mediaInfo.isRaw, source: 'cache' };
+        return { success: true, url: pathToFileURL(target).href, isRaw: mediaInfo.isRaw, source: 'cache', full };
       }
       if (this.previewInflight.has(key)) return this.previewInflight.get(key);
 
       const promise = this.previewLimiter(async () => {
-        const result = await this.generateImage(filePath, target, PREVIEW_MAX, mediaInfo, PREVIEW_QUALITY);
+        const result = await this.generateImage(filePath, target, maxSize, mediaInfo, quality);
         return {
           success: true,
           url: pathToFileURL(target).href,
           isRaw: mediaInfo.isRaw,
-          source: result.source
+          source: result.source,
+          full
         };
       }).catch((error) => ({
         success: false,

@@ -42,6 +42,7 @@ const items = Array.from({ length: 30 }, (_, index) => {
 
 const thumbnailOrder = [];
 const previewOrder = [];
+const previewFullRequests = [];
 
 function svgDataUrl(width, height, index) {
   const hue = (index * 47) % 360;
@@ -74,11 +75,21 @@ const api = {
       fromCache: false
     };
   },
-  getPreview: async (filePath) => {
+  getPreview: async (filePath, options = {}) => {
     previewOrder.push(filePath);
-    const index = items.findIndex((item) => item.path === filePath);
+    if (options && options.full) previewFullRequests.push(filePath);
+    const index = Math.max(0, items.findIndex((item) => item.path === filePath));
     await new Promise((resolve) => setTimeout(resolve, 120));
-    return { success: true, url: svgDataUrl(1100, 733, Math.max(0, index)), isRaw: true, source: 'fake' };
+    const [width, height] = ASPECTS[index % ASPECTS.length];
+    const maxSide = options && options.full ? 1600 : 1100;
+    const scale = maxSide / Math.max(width, height);
+    return {
+      success: true,
+      url: svgDataUrl(Math.round(width * scale), Math.round(height * scale), index),
+      isRaw: true,
+      source: 'fake',
+      full: Boolean(options && options.full)
+    };
   },
   preparePreview: async () => ({ success: true }),
   getSubfolders: async () => [],
@@ -107,7 +118,12 @@ const api = {
   onDirectoryChanged: () => () => {},
   getThumbnailOrder: () => thumbnailOrder.slice(),
   getPreviewOrder: () => previewOrder.slice(),
-  resetOrders: () => { thumbnailOrder.length = 0; previewOrder.length = 0; }
+  getPreviewFullRequests: () => previewFullRequests.slice(),
+  resetOrders: () => {
+    thumbnailOrder.length = 0;
+    previewOrder.length = 0;
+    previewFullRequests.length = 0;
+  }
 };
 
 contextBridge.exposeInMainWorld('api', api);

@@ -1219,12 +1219,8 @@ const Waterfall = {
     loading.textContent = imageInfo.isRaw ? `${imageInfo.rawFormat} 预览` : '加载中...';
     card.appendChild(loading);
 
-    if (imageInfo.isRaw) {
-      const badge = document.createElement('span');
-      badge.className = 'format-badge raw-badge';
-      badge.textContent = `RAW · ${imageInfo.rawFormat}`;
-      card.appendChild(badge);
-    }
+    // 左上角不再叠加格式角标：RAW 信息在灯箱信息栏和文件格式里都有，
+    // 卡片上留白更干净，也避免挡住照片主体。
     if (imageInfo.folder) {
       const pathBadge = document.createElement('span');
       pathBadge.className = 'path-badge';

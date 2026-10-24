@@ -328,9 +328,11 @@ const FolderTree = {
       if (intersects) {
         this.selectedFolders.add(folderPath);
         item.classList.add('selected');
+        item.setAttribute('aria-selected', 'true');
       } else if (!this._rubberBandCtrl) {
         this.selectedFolders.delete(folderPath);
         item.classList.remove('selected');
+        item.setAttribute('aria-selected', 'false');
       }
     });
   },
@@ -360,9 +362,11 @@ const FolderTree = {
       if (this.selectedFolders.has(fullPath)) {
         this.selectedFolders.delete(fullPath);
         item.classList.remove('selected');
+        item.setAttribute('aria-selected', 'false');
       } else {
         this.selectedFolders.add(fullPath);
         item.classList.add('selected');
+        item.setAttribute('aria-selected', 'true');
       }
       this.lastClickedFolderIndex = this._getVisibleFolderIndex(item);
     } else if (e.shiftKey) {
@@ -378,6 +382,7 @@ const FolderTree = {
           if (p && p !== this.rootPath) {
             this.selectedFolders.add(p);
             allItems[i].classList.add('selected');
+            allItems[i].setAttribute('aria-selected', 'true');
           }
         }
       }
@@ -407,7 +412,10 @@ const FolderTree = {
       this.clearSelection();
       this.selectedFolders.add(dirPath);
       const item = this.findWrapper(dirPath);
-      if (item) item.classList.add('selected');
+      if (item) {
+        item.classList.add('selected');
+        item.setAttribute('aria-selected', 'true');
+      }
     }
 
     const count = this.selectedFolders.size;

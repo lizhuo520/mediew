@@ -699,9 +699,11 @@ const Waterfall = {
       if (intersects) {
         this.selectedPaths.add(filePath);
         card.classList.add('selected');
+        card.setAttribute('aria-selected', 'true');
       } else if (!this._rubberBandCtrl) {
         this.selectedPaths.delete(filePath);
         card.classList.remove('selected');
+        card.setAttribute('aria-selected', 'false');
       }
     });
   },
@@ -739,9 +741,11 @@ const Waterfall = {
       if (this.selectedPaths.has(filePath)) {
         this.selectedPaths.delete(filePath);
         card.classList.remove('selected');
+        card.setAttribute('aria-selected', 'false');
       } else {
         this.selectedPaths.add(filePath);
         card.classList.add('selected');
+        card.setAttribute('aria-selected', 'true');
       }
       this.lastClickedIndex = domIndex;
     } else if (event.shiftKey) {
@@ -755,11 +759,13 @@ const Waterfall = {
         if (!targetPath) continue;
         this.selectedPaths.add(targetPath);
         target.classList.add('selected');
+        target.setAttribute('aria-selected', 'true');
       }
     } else {
       this.clearSelection();
       this.selectedPaths.add(filePath);
       card.classList.add('selected');
+      card.setAttribute('aria-selected', 'true');
       this.lastClickedIndex = domIndex;
     }
     // 鼠标选中的那张同时成为 Tab 的落点，键盘接着用不会跳回第一张
@@ -1327,6 +1333,7 @@ const Waterfall = {
         this.clearSelection();
         this.selectedPaths.add(imageInfo.path);
         card.classList.add('selected');
+        card.setAttribute('aria-selected', 'true');
       }
       const selectedImages = this.getSelectedImages();
       const canRename = SettingsManager.getSortMode() === 'filename' && selectedImages.length === 1;
@@ -1343,6 +1350,7 @@ const Waterfall = {
         this.clearSelection();
         this.selectedPaths.add(imageInfo.path);
         card.classList.add('selected');
+        card.setAttribute('aria-selected', 'true');
       }
       const selectedPaths = Array.from(this.selectedPaths);
       if (selectedPaths.length > 1) {

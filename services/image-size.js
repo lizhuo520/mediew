@@ -3,6 +3,7 @@
 // 必须经由 sharp-config 引入：它关闭了 libvips 的文件级缓存，
 // 否则读取 .webp / .gif 之后源文件会被 mmap 长期占用。
 const sharp = require('./sharp-config');
+const { Orientation } = require('../renderer/utils/orientation');
 
 // 与 media-service 保持一致的像素安全上限。
 const DEFAULT_MAX_INPUT_PIXELS = 300000000;
@@ -40,13 +41,9 @@ async function probeImageSize(filePath, options = {}) {
     let height = Number(metadata.height);
     if (!isSaneDimension(width) || !isSaneDimension(height)) return null;
 
-    const orientation = Number(metadata.orientation) || 1;
-    if (orientation >= 5 && orientation <= 8) {
-      const swapped = width;
-      width = height;
-      height = swapped;
-    }
-    return { width, height, orientation };
+    const orientation = Orientation.normalize(metadata.orientation);
+    const display = Orientation.toDisplaySize(width, height, orientation);
+    return { width: display.width, height: display.height, orientation };
   } catch (_) {
     return null;
   }

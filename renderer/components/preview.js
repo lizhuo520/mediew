@@ -1,6 +1,8 @@
 const Preview = {
   modal: null,
   image: null,
+  imageAlt: null,
+  standbyImage: null,
   video: null,
   container: null,
   imageArea: null,
@@ -14,6 +16,9 @@ const Preview = {
   lastToggleTime: 0,
   _previewToken: 0,
   _preloadImages: new Map(),
+  _layerA: null,
+  _layerB: null,
+  _swapTimer: null,
   _loadingEl: null,
   _loadingText: null,
   _zoomIndicator: null,
@@ -32,7 +37,10 @@ const Preview = {
 
   init() {
     this.modal = document.getElementById('preview-modal');
-    this.image = document.getElementById('preview-image');
+    this._layerA = document.getElementById('preview-image');
+    this._layerB = document.getElementById('preview-image-alt');
+    this.image = this._layerA;
+    this.imageAlt = this._layerB;
     this.video = document.getElementById('preview-video');
     this.imageArea = document.querySelector('.preview-image-area');
     this.container = document.querySelector('.preview-image-container');
@@ -60,7 +68,9 @@ const Preview = {
     document.addEventListener('mouseup', () => this.onMouseUp());
     this.container.addEventListener('dblclick', (e) => this.onDblClick(e));
 
-    this.image.addEventListener('dragstart', (e) => e.preventDefault());
+    [this._layerA, this._layerB].forEach((layer) => {
+      layer.addEventListener('dragstart', (e) => e.preventDefault());
+    });
     document.addEventListener('keydown', (e) => this.onKeyDown(e));
 
     const filenameEl = document.getElementById('info-filename');
@@ -254,10 +264,11 @@ const Preview = {
   },
 
   applyTransform(animate) {
+    // 未显式指定时保留 opacity 过渡：交叉淡化与缩放互不干扰。
     if (animate) {
-      this.image.style.transition = 'transform 0.3s cubic-bezier(0.25, 0.1, 0.25, 1)';
+      this.image.style.transition = 'transform 0.3s cubic-bezier(0.25, 0.1, 0.25, 1), opacity 0.22s ease';
     } else {
-      this.image.style.transition = 'none';
+      this.image.style.transition = 'transform 0s, opacity 0.22s ease';
     }
 
     this.image.style.transform = `translate(${this.panX}px, ${this.panY}px) scale(${this.scale})`;
@@ -307,6 +318,30 @@ const Preview = {
     this.showZoomIndicator();
   },
 
+  cancelSwap() {
+    if (this._swapTimer) {
+      clearTimeout(this._swapTimer);
+      this._swapTimer = null;
+    }
+  },
+
+  resetLayers() {
+    this.cancelSwap();
+    [this._layerA, this._layerB].forEach((layer) => {
+      layer.onload = null;
+      layer.onerror = null;
+      layer.src = '';
+      layer.classList.remove('loaded');
+      layer.style.opacity = '0';
+      layer.style.display = 'none';
+      layer.style.transform = '';
+      layer.style.transition = 'none';
+    });
+    this.image = this._layerA;
+    this.imageAlt = this._layerB;
+    this.standbyImage = this._layerB;
+  },
+
   open(imageList, index) {
     this.imageList = imageList;
     this.currentIndex = index;
@@ -314,7 +349,8 @@ const Preview = {
     this.panX = 0;
     this.panY = 0;
     this.scale = 1;
-    this.showImage();
+    this.resetLayers();
+    this.showImage(0, { immediate: true });
     this.modal.classList.add('active');
   },
 
@@ -322,10 +358,7 @@ const Preview = {
     this._previewToken += 1;
     this.hideLoading();
     this.modal.classList.remove('active');
-    this.image.onload = null;
-    this.image.onerror = null;
-    this.image.src = '';
-    this.image.classList.remove('loaded');
+    this.resetLayers();
     this.video.src = '';
     this.video.pause();
     this.container.classList.remove('video-mode');
@@ -340,22 +373,24 @@ const Preview = {
     this._preloadImages.clear();
   },
 
-  async showImage() {
+  async showImage(direction = 1, options = {}) {
     if (this.currentIndex < 0 || this.currentIndex >= this.imageList.length) return;
     const img = this.imageList[this.currentIndex];
-    this.image.classList.remove('loaded');
-    this.image.style.transition = 'none';
+    const token = ++this._previewToken;
+    this.cancelSwap();
     this.video.style.display = 'none';
     document.getElementById('video-controls').classList.remove('active');
-    this.panX = 0;
-    this.panY = 0;
-    this.scale = 1;
-    this.image.style.transform = 'translate(0px, 0px) scale(1)';
     this.isVideo = img.type === 'video';
 
     if (this.isVideo) {
       this.hideLoading();
-      this.image.style.display = 'none';
+      [this._layerA, this._layerB].forEach((layer) => {
+        layer.classList.remove('loaded');
+        layer.style.opacity = '0';
+        layer.style.display = 'none';
+      });
+      this.image = this._layerA;
+      this.standbyImage = this._layerB;
       this.video.style.display = 'block';
       this.container.classList.add('video-mode');
       document.getElementById('video-controls').classList.add('active');
@@ -380,19 +415,44 @@ const Preview = {
       return;
     }
 
-    this.image.style.display = 'block';
     this.container.classList.remove('video-mode');
     this.updateNav();
     this.updateInfo(img);
+
+    const hasVisibleImage = Boolean(this.image && this.image.classList.contains('loaded'));
+    // 首次打开就复用主图层；翻页时用备用图层承接新图，旧图保持可见直到解码完成。
+    const incoming = (!options.immediate && hasVisibleImage && this.standbyImage)
+      ? this.standbyImage
+      : this.image;
+    const outgoing = incoming === this.image ? null : this.image;
+
+    incoming.onload = null;
+    incoming.onerror = null;
+    incoming.classList.remove('loaded');
+    incoming.style.display = 'block';
+    incoming.style.opacity = '0';
+    incoming.style.transition = 'transform 0.3s cubic-bezier(0.25, 0.1, 0.25, 1), opacity 0.22s ease';
+    incoming.style.transform = `translate(${direction * 22}px, 0px) scale(0.985)`;
+
+    this.panX = 0;
+    this.panY = 0;
+    this.scale = 1;
     this.showLoading(this.needsGeneratedPreview(img) ? '正在生成预览…' : '正在加载…');
-    const token = ++this._previewToken;
-    this.image.onload = () => {
-      if (token === this._previewToken) this.onImageReady();
+
+    incoming.onload = () => {
+      if (token !== this._previewToken || !this.isOpen) return;
+      this.onImageReady(incoming, outgoing, img, direction);
     };
-    this.image.onerror = () => {
+    incoming.onerror = () => {
       if (token !== this._previewToken) return;
+      // 空 src / 页面 URL 是清空图层时浏览器抛的伪错误，不是真的加载失败。
+      const srcAttr = incoming.getAttribute('src');
+      if (!srcAttr || srcAttr === 'about:blank') return;
       this.hideLoading();
       document.getElementById('info-dimensions').textContent = '加载失败';
+      Toast.error(`${img.name}：图片加载失败`);
+      // 新图失败时把旧图恢复出来，用户不会看到"翻页后整屏变黑"。
+      if (outgoing && outgoing.classList.contains('loaded')) outgoing.style.opacity = '1';
     };
 
     if (this.needsGeneratedPreview(img)) {
@@ -407,29 +467,52 @@ const Preview = {
         document.getElementById('info-dimensions').textContent = message;
         // 信息栏在右侧、图像区是空的，只有这一行小字太容易被忽略，再弹一次提示
         Toast.error(`${img.name}：${message}`);
+        if (outgoing && outgoing.classList.contains('loaded')) outgoing.style.opacity = '1';
         // 生成失败也要预热相邻项，避免连续翻页时每张都从零等待。
         this.prefetchAdjacent();
         return;
       }
-      this.image.src = result.url;
+      incoming.src = result.url;
     } else {
-      this.image.src = Waterfall.getFileURL(img.path);
+      incoming.src = Waterfall.getFileURL(img.path);
     }
   },
 
-  onImageReady() {
+  onImageReady(incoming, outgoing, img, direction) {
     this.hideLoading();
+    this.image = incoming;
+    this.standbyImage = incoming === this._layerA ? this._layerB : this._layerA;
     this.calcScales();
     this.scale = this.fitScale;
     this.panX = 0;
     this.panY = 0;
-    this.image.classList.add('loaded');
-    this.applyTransform(false);
+    incoming.classList.add('loaded');
+    // 从 0.985 / 位移状态过渡到适配尺寸；方向只影响入场的一点点位移。
+    void incoming.offsetWidth;
+    this.applyTransform(true);
+    incoming.style.opacity = '1';
 
-    const img = this.imageList[this.currentIndex];
+    if (outgoing && outgoing !== incoming) {
+      outgoing.style.opacity = '0';
+      this._swapTimer = setTimeout(() => {
+        if (this.image === outgoing) return;
+        // 必须先解绑再清空 src：对 <img> 赋空 src 会触发 error，
+        // 此时 onerror 还挂着就会误报「上一张加载失败」。
+        outgoing.onload = null;
+        outgoing.onerror = null;
+        outgoing.classList.remove('loaded');
+        outgoing.style.display = 'none';
+        outgoing.src = '';
+        outgoing.style.transform = '';
+        this._swapTimer = null;
+      }, 240);
+    }
+
     if (img) {
       const suffix = img.isRaw ? ' · RAW 预览' : '';
-      document.getElementById('info-dimensions').textContent = `${this.image.naturalWidth} × ${this.image.naturalHeight} px${suffix}`;
+      const width = img.width > 0 ? img.width : incoming.naturalWidth;
+      const height = img.height > 0 ? img.height : incoming.naturalHeight;
+      document.getElementById('info-dimensions').textContent = `${width} × ${height} px${suffix}`;
       this.prefetchAdjacent();
     }
   },
@@ -497,14 +580,14 @@ const Preview = {
   prev() {
     if (this.currentIndex > 0) {
       this.currentIndex--;
-      this.showImage();
+      this.showImage(-1);
     }
   },
 
   next() {
     if (this.currentIndex < this.imageList.length - 1) {
       this.currentIndex++;
-      this.showImage();
+      this.showImage(1);
     }
   },
 

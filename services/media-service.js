@@ -20,6 +20,7 @@ const {
   formatExposure,
   parseDimensions
 } = require('./date-utils');
+const { Orientation } = require('../renderer/utils/orientation');
 
 // 限制 sharp 处理超大图片时的像素数，防止异常文件拖垮进程。
 const MAX_INPUT_PIXELS = 300000000;
@@ -34,7 +35,7 @@ const PREVIEW_MAX = 4096;
 const PREVIEW_QUALITY = 92;
 
 // 缓存内容版本号：缩略图/预览的语义变化时递增，旧条目会因为键变化而自动失效。
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3-orientation';
 
 // 宽高比探测的并发上限。sharp 只读文件头，属于轻量 IO 任务，
 // 但 Windows 上过高的并发会让磁盘队列变长，因此取 16。
@@ -147,10 +148,12 @@ class MediaService {
     this.favoritesFile = path.join(userDataPath, 'favorites.json');
     // 缓存文件名带版本：v1 存的是未按 EXIF 方向转正的宽高，
     // 会让竖拍照片的占位比例反过来，因此必须整体失效。
-    this.metadataCache = new MetadataCache(path.join(userDataPath, 'metadata-cache-v2.json'));
+    this.metadataCache = new MetadataCache(path.join(userDataPath, 'metadata-cache-v3.json'));
     // 宽高比缓存单独存放：它在缩略图生成前就要用上，
     // 与 EXIF 的「待补齐」状态（metadataPending）互不影响。
-    this.dimensionCache = new MetadataCache(path.join(userDataPath, 'dimension-cache.json'));
+    // v2 起使用统一的 Orientation 归一化规则，旧缓存可能带错误显示尺寸。
+    this.dimensionCache = new MetadataCache(path.join(userDataPath, 'dimension-cache-v2.json'));
+    this.rawOrientationCache = new Map();
 
     // ExifTool 使用子进程池；限制进程数可避免 RAW 扫描占满全部 CPU。
     const maxProcs = Math.max(2, Math.min(4, os.cpus().length || 2));
@@ -473,8 +476,8 @@ class MediaService {
     // 瀑布流占位和信息面板需要的是「显示尺寸」，因此这里与 probeImageSize()
     // 使用同一规则：Orientation 5~8 时交换宽高，保证与 sharp().rotate() 的
     // 输出、以及 <img> 的实际朝向三者一致。
-    const orientation = Number(tags.Orientation) || 1;
-    const rotated = orientation >= 5 && orientation <= 8;
+    const orientation = Orientation.normalize(tags.Orientation);
+    const displayDimensions = Orientation.toDisplaySize(dimensions.width, dimensions.height, orientation);
 
     return {
       ...dateInfo,
@@ -483,8 +486,8 @@ class MediaService {
       aperture: formatAperture(tags.FNumber || tags.ApertureValue),
       shutter: formatExposure(tags.ExposureTime || tags.ShutterSpeedValue),
       iso: normalizeIso(tags.ISO || tags.ISOSetting || tags.RecommendedExposureIndex),
-      width: rotated ? dimensions.height : dimensions.width,
-      height: rotated ? dimensions.width : dimensions.height,
+      width: displayDimensions.width,
+      height: displayDimensions.height,
       orientation,
       metadataPending: false,
       metadataError: false
@@ -636,11 +639,18 @@ class MediaService {
    * 标准图片缩放。orientation 会自动应用，输出 progressive JPEG 以便浏览器渐进显示。
    * 继续使用 mozjpeg：与 gkpv 的 Chromium 编码相比，同等 quality 下体积更小。
    */
-  async resizeWithSharp(source, targetPath, maxSize, quality = THUMBNAIL_QUALITY) {
+  async resizeWithSharp(source, targetPath, maxSize, quality = THUMBNAIL_QUALITY, options = {}) {
     const inputOptions = { failOn: 'none', limitInputPixels: MAX_INPUT_PIXELS };
     if (typeof source === 'string') inputOptions.sequentialRead = true;
-    await sharp(source, inputOptions)
-      .rotate()
+    let pipeline = sharp(source, inputOptions);
+    // 输入自带 EXIF 时用 rotate() 自动定向；RAW 内嵌 JPEG 若没有方向标签，
+    // 则用源 RAW 的 Orientation 显式旋转，避免内嵌预览与主文件方向不一致。
+    if (options.explicitOrientation) {
+      pipeline = Orientation.applyToSharp(pipeline, options.explicitOrientation);
+    } else {
+      pipeline = pipeline.rotate();
+    }
+    await pipeline
       .resize({
         width: maxSize,
         height: maxSize,
@@ -676,12 +686,16 @@ class MediaService {
     }
 
     // 直接从 ExifTool 读取二进制预览，避免 Windows 临时文件句柄未释放导致 EPERM。
+    const sourceOrientation = await this.getSourceOrientation(filePath);
     const previewTags = ['PreviewImage', 'JpgFromRaw', 'ThumbnailImage', 'OtherImage'];
     for (const tagName of previewTags) {
       try {
         const buffer = await this.exiftool.extractBinaryTagToBuffer(tagName, filePath);
         if (buffer && buffer.length > 0) {
-          await this.resizeWithSharp(buffer, targetPath, maxSize, quality);
+          const embedded = await sharp(buffer, { failOn: 'none', limitInputPixels: MAX_INPUT_PIXELS }).metadata();
+          const embeddedOrientation = Orientation.normalize(embedded && embedded.orientation);
+          const explicitOrientation = embeddedOrientation === 1 && sourceOrientation !== 1 ? sourceOrientation : null;
+          await this.resizeWithSharp(buffer, targetPath, maxSize, quality, { explicitOrientation });
           return { source: `buffer:${tagName}` };
         }
       } catch (error) {
@@ -698,6 +712,35 @@ class MediaService {
     }
 
     throw new Error(`未找到可解码的 RAW 预览${lastError && lastError.message ? `：${lastError.message}` : ''}`);
+  }
+
+  /**
+   * 读取 RAW 主文件方向，供没有 EXIF 的内嵌 JPEG 使用。
+   * 只取 Orientation 一个标签，并按文件签名做小幅缓存，避免预览/缩略图重复解析。
+   */
+  async getSourceOrientation(filePath) {
+    try {
+      const stat = await fsp.stat(filePath);
+      const signature = `${stat.size}:${Math.floor(stat.mtimeMs)}`;
+      const key = `${filePath}|${signature}`;
+      if (this.rawOrientationCache.has(key)) return this.rawOrientationCache.get(key);
+      // 目录扫描通常已经读过一次 EXIF，能命中就省掉一次 ExifTool 子进程往返。
+      const cached = this.metadataCache.get(filePath, signature);
+      if (cached && cached.orientation) {
+        const orientation = Orientation.normalize(cached.orientation);
+        this.rawOrientationCache.set(key, orientation);
+        return orientation;
+      }
+      const tags = await this.exiftool.readRaw(filePath, ['-Orientation']);
+      const orientation = Orientation.normalize(tags && tags.Orientation);
+      this.rawOrientationCache.set(key, orientation);
+      if (this.rawOrientationCache.size > 200) {
+        this.rawOrientationCache.delete(this.rawOrientationCache.keys().next().value);
+      }
+      return orientation;
+    } catch (_) {
+      return 1;
+    }
   }
 
   async commitTemporaryFile(source, target) {

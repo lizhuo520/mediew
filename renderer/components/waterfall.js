@@ -19,11 +19,14 @@ const Waterfall = {
   _loadMoreObserver: null,
   _thumbnailObserver: null,
   _thumbnailQueue: [],
+  _thumbnailSequence: 0,
   _activeThumbnails: 0,
+  _masonryRaf: null,
   // 与 gkpv 的 THUMB_CONCURRENCY 一致：渲染层最多同时排队 8 个缩略图请求。
   _thumbnailConcurrency: 8,
   _batchSize: 80,
   _cardImageMap: new WeakMap(),
+  _cardByPath: new Map(),
   _thumbnailFailed: 0,
   _thumbnailFailedNames: [],
 
@@ -326,11 +329,29 @@ const Waterfall = {
   setupThumbnailObserver() {
     if (this._thumbnailObserver) this._thumbnailObserver.disconnect();
     this._thumbnailObserver = new IntersectionObserver((entries) => {
-      entries.forEach((entry) => {
+      const candidates = [];
+      entries.forEach((entry, order) => {
         if (!entry.isIntersecting) return;
         this._thumbnailObserver.unobserve(entry.target);
         const imageInfo = this._cardImageMap.get(entry.target);
-        if (imageInfo) this.scheduleThumbnail(entry.target, imageInfo, this._generation);
+        if (!imageInfo) return;
+        const position = this.getCardVisualPosition(entry.target);
+        candidates.push({
+          card: entry.target,
+          imageInfo,
+          top: position.top,
+          left: position.left,
+          order
+        });
+      });
+      // IntersectionObserver 的回调顺序不保证等于视觉顺序；显式按
+      // 「先上后下、同一行先左后右」排一遍，缩略图请求才会逐行推进。
+      MediewMasonry.sortVisualJobs(candidates);
+      candidates.forEach((candidate) => {
+        this.scheduleThumbnail(candidate.card, candidate.imageInfo, this._generation, {
+          top: candidate.top,
+          left: candidate.left
+        });
       });
     }, {
       root: this.container,
@@ -398,8 +419,162 @@ const Waterfall = {
   },
 
   applyWaterfallZoom() {
+    // 旧实现用 column-count，浏览器会先填满一列再换列，DOM 顺序与视觉顺序相反。
+    // 现在由 layoutMasonryCards() 显式计算每张卡片的 left/top/width/height：
+    // 行内从左到右铺满，行与行从上到下推进。
+    this.grid.style.columnCount = '';
+    this.layoutMasonryCards();
+  },
+
+  /**
+   * 卡片相对滚动内容左上角的位置。缩略图调度用它做视觉排序。
+   */
+  getCardVisualPosition(card) {
+    const rect = card.getBoundingClientRect();
+    const containerRect = this.container.getBoundingClientRect();
+    return {
+      top: rect.top - containerRect.top + this.container.scrollTop,
+      left: rect.left - containerRect.left + this.container.scrollLeft
+    };
+  },
+
+  isMasonryMode() {
+    return SettingsManager.getSortMode() !== 'filename' && SettingsManager.getLayoutMode() !== 'grid';
+  },
+
+  getMasonryMetrics() {
+    const styles = getComputedStyle(this.grid);
+    return {
+      paddingLeft: parseFloat(styles.paddingLeft) || 0,
+      paddingTop: parseFloat(styles.paddingTop) || 0,
+      paddingRight: parseFloat(styles.paddingRight) || 0,
+      paddingBottom: parseFloat(styles.paddingBottom) || 0,
+      gap: parseFloat(styles.columnGap) || 8
+    };
+  },
+
+  positionCard(card, left, top, width, height) {
+    card.style.position = 'absolute';
+    card.style.left = `${Math.round(left)}px`;
+    card.style.top = `${Math.round(top)}px`;
+    card.style.width = `${Math.round(width)}px`;
+    card.style.height = `${Math.round(height)}px`;
+    card.style.margin = '0';
+    // 行式布局已给出精确的宽高，图片只需填满卡片，不能再被 aspect-ratio 撑开。
+    const image = card.querySelector('.media-thumb');
+    if (image) image.style.aspectRatio = 'auto';
+  },
+
+  clearMasonryLayout() {
+    this.grid.querySelectorAll('.image-card, .date-header, .load-more-sentinel, .grid-loading').forEach((el) => {
+      el.style.position = '';
+      el.style.left = '';
+      el.style.top = '';
+      el.style.width = '';
+      el.style.height = '';
+      el.style.margin = '';
+      el.style.gridRowEnd = '';
+      const image = el.querySelector ? el.querySelector('.media-thumb') : null;
+      if (image) image.style.aspectRatio = '';
+    });
+    this.grid.style.height = '';
+  },
+
+  scheduleMasonryLayout() {
+    if (!this.isMasonryMode() || this._masonryRaf) return;
+    this._masonryRaf = requestAnimationFrame(() => {
+      this._masonryRaf = null;
+      this.layoutMasonryCards();
+    });
+  },
+
+  /**
+   * 行式瀑布流排版：按 DOM 顺序把卡片装进一行，行宽铺满容器，
+   * 行高由该行总宽高比反算；日期标题/加载占位单独占整行。
+   *
+   * 这样视觉顺序严格等于 DOM 顺序，缩略图调度只需按 DOM 顺序推进，
+   * 不会再出现“第 4 张跑到右列、第 5 张跳回左列”的横跳。
+   */
+  layoutMasonryCards() {
+    if (!this.isMasonryMode()) {
+      this.clearMasonryLayout();
+      return;
+    }
+    if (!this.grid || !this.grid.clientWidth) return;
+    // 空目录/筛选无结果时，空状态铺满容器，不能被压成 padding 高度。
+    if (this.grid.querySelector('.empty-state')) {
+      this.grid.style.height = '100%';
+      return;
+    }
+
+    const metrics = this.getMasonryMetrics();
+    const availableWidth = Math.max(1, this.grid.clientWidth - metrics.paddingLeft - metrics.paddingRight);
     const columns = Math.max(1, Math.round(3 / this.zoomLevel));
-    this.grid.style.columnCount = columns;
+    // 让 4:3 照片大致按 zoomLevel 推出的列数排列。
+    const targetHeight = Math.max(
+      80,
+      (availableWidth - metrics.gap * (columns - 1)) / columns / 1.33
+    );
+
+    let top = metrics.paddingTop;
+    let segment = [];
+
+    const flushSegment = () => {
+      if (segment.length === 0) return;
+      const aspects = segment.map((card) => parseFloat(card.dataset.aspect) || MediewMasonry.DEFAULT_ASPECT);
+      const layout = MediewMasonry.layoutRows(aspects, {
+        availableWidth,
+        gap: metrics.gap,
+        targetHeight
+      });
+      layout.positions.forEach((position) => {
+        const card = segment[position.index];
+        if (!card) return;
+        this.positionCard(
+          card,
+          metrics.paddingLeft + position.left,
+          top + position.top,
+          position.width,
+          position.height
+        );
+      });
+      top += layout.totalHeight + metrics.gap;
+      segment = [];
+    };
+
+    Array.from(this.grid.children).forEach((child) => {
+      if (child.classList.contains('image-card')) {
+        segment.push(child);
+        return;
+      }
+      if (
+        child.classList.contains('date-header') ||
+        child.classList.contains('load-more-sentinel') ||
+        child.classList.contains('grid-loading')
+      ) {
+        flushSegment();
+        child.style.position = 'absolute';
+        child.style.left = `${Math.round(metrics.paddingLeft)}px`;
+        child.style.top = `${Math.round(top)}px`;
+        child.style.width = `${Math.round(availableWidth)}px`;
+        child.style.height = 'auto';
+        child.style.margin = '0';
+        const height = child.offsetHeight || 0;
+        top += height + metrics.gap;
+      }
+    });
+    flushSegment();
+
+    const contentHeight = Math.max(0, top - metrics.gap) + metrics.paddingBottom;
+    this.grid.style.height = `${Math.round(contentHeight)}px`;
+  },
+
+  getCardByPath(path) {
+    const cached = this._cardByPath.get(path);
+    if (cached && cached.isConnected) return cached;
+    const card = this.grid.querySelector(`.image-card[data-path="${CSS.escape(path)}"]`);
+    if (card) this._cardByPath.set(path, card);
+    return card;
   },
 
   applyGridZoom(containerWidth) {
@@ -408,11 +583,13 @@ const Waterfall = {
     const columns = Math.max(1, Math.floor((containerWidth + gap) / (imageHeight + gap)));
     this.grid.style.gridTemplateColumns = `repeat(${columns}, 1fr)`;
     this.grid.style.setProperty('--grid-image-height', `${imageHeight}px`);
+    this.clearMasonryLayout();
   },
 
   applyFilenameZoom() {
     const cardWidth = Math.round(180 * this.zoomLevel);
     this.grid.style.setProperty('--filename-card-width', `${cardWidth}px`);
+    this.clearMasonryLayout();
   },
 
   setupSelection() {
@@ -555,6 +732,11 @@ const Waterfall = {
   async loadImages(dirPath) {
     const generation = ++this._generation;
     this.currentDirectory = dirPath;
+    // 换目录时旧队列里的卡片已经不可达，继续留着只会白占内存和调度时间。
+    this.disconnectRenderObservers();
+    this._thumbnailQueue.length = 0;
+    this._cardByPath.clear();
+    this.grid.style.height = '';
     this.grid.innerHTML = '<div class="grid-loading">正在读取目录...</div>';
     this.grid.classList.remove('hidden');
     document.getElementById('welcome-screen').classList.add('hidden');
@@ -645,7 +827,9 @@ const Waterfall = {
     }
     payload.items.forEach((size) => {
       const target = this._allImageByPath.get(size.path);
-      if (!target || target.width > 0) return;
+      if (!target) return;
+      // 文件头探测读到的是「应用 EXIF 方向后的显示尺寸」，比旧缓存或缺失的
+      // EXIF 尺寸更可靠，因此允许它覆盖已有值（修掉历史错误宽高比）。
       target.width = size.width;
       target.height = size.height;
       this.applyCardAspect(target);
@@ -665,10 +849,10 @@ const Waterfall = {
    */
   applyCardAspect(imageInfo) {
     if (!imageInfo.width || !imageInfo.height) return;
-    const card = this.grid.querySelector(`.image-card[data-path="${CSS.escape(imageInfo.path)}"]`);
+    const card = this.getCardByPath(imageInfo.path);
     if (!card) return;
-    const image = card.querySelector('.media-thumb');
-    if (image) image.style.aspectRatio = `${imageInfo.width} / ${imageInfo.height}`;
+    card.dataset.aspect = String(MediewMasonry.aspectOf(imageInfo));
+    this.scheduleMasonryLayout();
   },
 
   bufferScanPayload(scanId, key, value) {
@@ -722,6 +906,7 @@ const Waterfall = {
     }
     this.disconnectRenderObservers();
     this.grid.innerHTML = '';
+    this.grid.style.height = '';
     this._renderPlan = this.buildRenderPlan(this.imageList);
     this._renderIndex = 0;
     this.appendNextBatch(previousCards);
@@ -760,7 +945,7 @@ const Waterfall = {
   appendNextBatch(minimumCards = 0) {
     if (!this._renderPlan.length) {
       this.grid.innerHTML = `
-        <div class="empty-state" style="column-span: all;">
+        <div class="empty-state">
           <svg viewBox="0 0 24 24" width="32" height="32" fill="currentColor">
             <path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/>
           </svg>
@@ -796,14 +981,17 @@ const Waterfall = {
         fragment.appendChild(card);
         appendedCards += 1;
         this._cardImageMap.set(card, entry.item);
+        this._cardByPath.set(entry.item.path, card);
         newCards.push(card);
       }
       appendedSlots += 1;
       if (minimumCards > 0 && appendedCards >= minimumCards) break;
     }
     this.grid.appendChild(fragment);
+    // 挂载后才能量到真实宽度，统一算跨行数（卡片按比例、标题按内容高度）。
+    this.layoutMasonryCards();
     // 必须在挂载后观察，Chromium 才会为首次可见卡片产生 intersection 回调。
-    newCards.forEach((card) => this._thumbnailObserver.observe(card));
+    if (this._thumbnailObserver) newCards.forEach((card) => this._thumbnailObserver.observe(card));
 
     if (this._renderIndex < this._renderPlan.length) {
       this._loadMoreSentinel = document.createElement('div');
@@ -811,6 +999,8 @@ const Waterfall = {
       this._loadMoreSentinel.setAttribute('role', 'presentation');
       this._loadMoreSentinel.textContent = '继续加载...';
       this.grid.appendChild(this._loadMoreSentinel);
+      // 先定位再观察：否则占位可能在静态流里位于顶部，被判定为可见后连续拉取。
+      this.layoutMasonryCards();
       this.observeLoadMore();
     }
     // 新批次里可能还没有任何 tabindex="0" 的卡片（首批渲染、或原来那张被删除）
@@ -838,15 +1028,34 @@ const Waterfall = {
       this._loadMoreSentinel.remove();
       this._loadMoreSentinel = null;
     }
+    // 卡片即将被整体替换，旧观察目标和排队任务都失去意义。
+    if (this._thumbnailObserver) this._thumbnailObserver.disconnect();
+    this._thumbnailQueue.length = 0;
+    this._cardByPath.clear();
+    if (this._masonryRaf) {
+      cancelAnimationFrame(this._masonryRaf);
+      this._masonryRaf = null;
+    }
   },
 
-  scheduleThumbnail(card, imageInfo, generation) {
+  scheduleThumbnail(card, imageInfo, generation, visualPosition) {
     if (!card.isConnected || generation !== this._generation) return;
-    this._thumbnailQueue.push({ card, imageInfo, generation });
+    const position = visualPosition || this.getCardVisualPosition(card);
+    this._thumbnailQueue.push({
+      card,
+      imageInfo,
+      generation,
+      top: position.top,
+      left: position.left,
+      order: ++this._thumbnailSequence
+    });
     this.pumpThumbnailQueue();
   },
 
   pumpThumbnailQueue() {
+    // 队列里可能混着不同批次、不同视觉位置的任务，取队首前先按视觉顺序排一遍，
+    // 否则先进入观察范围的下半屏卡片会抢在上半屏之前加载。
+    if (this._thumbnailQueue.length > 1) MediewMasonry.sortVisualJobs(this._thumbnailQueue);
     while (this._activeThumbnails < this._thumbnailConcurrency && this._thumbnailQueue.length > 0) {
       const job = this._thumbnailQueue.shift();
       if (job.generation !== this._generation || !job.card.isConnected) continue;
@@ -875,6 +1084,12 @@ const Waterfall = {
     // 必须先注册回调再设置 src：命中内存缓存时 load 事件可能紧接着就触发。
     image.addEventListener('load', () => {
       if (generation !== this._generation) return;
+      // 缩略图已经过 sharp().rotate() 转正，像素比例就是最终显示比例，
+      // 用它覆盖元数据推算的比例可以兜住历史缓存里的错误方向。
+      if (image.naturalWidth > 0 && image.naturalHeight > 0) {
+        card.dataset.aspect = String(image.naturalWidth / image.naturalHeight);
+        this.scheduleMasonryLayout();
+      }
       card.classList.add('thumbnail-loaded');
       card.querySelector('.image-loading')?.remove();
     }, { once: true });
@@ -891,6 +1106,10 @@ const Waterfall = {
     video.load();
     video.addEventListener('loadeddata', () => {
       if (generation !== this._generation) return;
+      if (video.videoWidth > 0 && video.videoHeight > 0) {
+        card.dataset.aspect = String(video.videoWidth / video.videoHeight);
+        this.scheduleMasonryLayout();
+      }
       card.classList.add('thumbnail-loaded');
       card.querySelector('.image-loading')?.remove();
     }, { once: true });
@@ -926,6 +1145,7 @@ const Waterfall = {
     const card = document.createElement('div');
     card.className = imageInfo.type === 'video' ? 'image-card filename-card video-card' : 'image-card filename-card';
     card.dataset.path = imageInfo.path;
+    card.dataset.aspect = String(MediewMasonry.aspectOf(imageInfo));
     this.applyCardAccessibility(card, imageInfo);
     const name = this.createFilenameElement(imageInfo);
     card.appendChild(name);
@@ -943,6 +1163,7 @@ const Waterfall = {
     const card = document.createElement('div');
     card.className = imageInfo.type === 'video' ? 'image-card video-card' : 'image-card';
     card.dataset.path = imageInfo.path;
+    card.dataset.aspect = String(MediewMasonry.aspectOf(imageInfo));
     this.applyCardAccessibility(card, imageInfo);
     if (imageInfo.type === 'video') {
       card.appendChild(this.createVideoElement(imageInfo));
@@ -972,10 +1193,7 @@ const Waterfall = {
     // 再加一层原生懒加载会让视口外的卡片出现「src 已设置但 naturalWidth 恒为 0」
     // 的状态，卡片会一直停在占位态，缩略图状态也不再可判定。
     image.decoding = 'async';
-    // 已知宽高比时先按比例占位，缩略图到达后不会引起瀑布流跳动。
-    if (imageInfo.width > 0 && imageInfo.height > 0) {
-      image.style.aspectRatio = `${imageInfo.width} / ${imageInfo.height}`;
-    }
+    // 宽高比由卡片 dataset.aspect 参与行布局，图片本身只负责填满卡片。
     return image;
   },
 

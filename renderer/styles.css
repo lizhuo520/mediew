@@ -347,11 +347,42 @@ body {
 }
 
 /* Image Grid (Waterfall) */
+/* 瀑布流改为「行式」绝对定位布局（见 Waterfall.layoutMasonryCards）：
+   每行按宽高比铺满容器宽度，行与行从上到下推进。
+   column-count 会按列填充，DOM 顺序与视觉顺序相反，已弃用。 */
 #image-grid {
-  column-count: 3;
-  column-gap: 8px;
+  display: block;
+  position: relative;
+  min-height: 100%;
   padding: 12px;
   box-sizing: border-box;
+}
+
+/* 行式瀑布流里卡片一律由 JS 给出精确坐标；网格/文件名模式会覆盖回静态布局。 */
+#image-grid:not(.grid-mode):not(.filename-mode) .image-card {
+  position: absolute;
+  margin: 0;
+  min-height: 0;
+  align-self: auto;
+}
+
+#image-grid:not(.grid-mode):not(.filename-mode) .image-card .media-thumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+#image-grid:not(.grid-mode):not(.filename-mode) .video-thumb-wrapper {
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  aspect-ratio: auto;
+}
+
+#image-grid:not(.grid-mode):not(.filename-mode) .video-thumb-wrapper video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
 }
 
 #image-grid.hidden {
@@ -360,7 +391,8 @@ body {
 
 /* Date Header */
 .date-header {
-  column-span: all;
+  grid-column: 1 / -1;
+  align-self: start;
   padding: 16px 4px 12px;
   font-size: 14px;
   color: var(--text-tertiary);
@@ -532,17 +564,33 @@ body {
   background: var(--hover-bg);
 }
 
-#preview-image {
+/* 灯箱用两个图层交替：新图先在自己的图层里解码，完成后与旧图交叉淡化。
+   绝对定位 + inset:0 + margin:auto 让原尺寸图片仍然居中，
+   transform 依旧只负责缩放/平移，两者互不干扰。 */
+.preview-image-layer {
+  position: absolute;
+  inset: 0;
+  margin: auto;
   object-fit: contain;
-  transition: transform 0.25s ease;
+  image-orientation: from-image;
   transform-origin: center center;
   user-select: none;
   -webkit-user-drag: none;
   visibility: hidden;
+  opacity: 0;
+  transition: opacity 0.22s ease;
+  will-change: opacity, transform;
 }
 
-#preview-image.loaded {
+.preview-image-layer.loaded {
   visibility: visible;
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .preview-image-layer {
+    transition: none;
+  }
 }
 
 .preview-close {
@@ -674,18 +722,9 @@ body {
   opacity: 0.5;
 }
 
-/* Responsive columns */
-@media (max-width: 1200px) {
-  #image-grid:not(.grid-mode) {
-    column-count: 2;
-  }
-}
-
+/* Responsive columns：列数由 Waterfall.applyWaterfallZoom() 按缩放级别写内联样式，
+   这里只处理侧栏宽度，不再用 column-count（已改为 Grid masonry）。 */
 @media (max-width: 800px) {
-  #image-grid:not(.grid-mode) {
-    column-count: 1;
-  }
-  
   #main-content {
     grid-template-columns: 200px 1fr;
   }
@@ -695,11 +734,22 @@ body {
 #image-grid.grid-mode {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
+  grid-auto-rows: auto;
   gap: 8px;
 }
 
 #image-grid.grid-mode .date-header {
   grid-column: 1 / -1;
+}
+
+#image-grid.grid-mode .image-card,
+#image-grid.filename-mode .image-card {
+  grid-row-end: auto;
+}
+
+#image-grid.grid-mode .video-thumb-wrapper {
+  aspect-ratio: auto;
+  height: var(--grid-image-height, 200px);
 }
 
 #image-grid.grid-mode .image-card img {
@@ -1474,6 +1524,8 @@ body {
   width: 100%;
   display: block;
   object-fit: cover;
+  /* 缩略图已由 sharp 转正；原图/视频封面若带 EXIF，浏览器也按方向显示。 */
+  image-orientation: from-image;
   /* 缩略图生成完成后淡入，避免硬切；与 gkpv 的 `.card img.loaded` 一致。 */
   opacity: 0;
   transition: opacity 0.3s ease;
@@ -1567,9 +1619,14 @@ body {
   box-shadow: inset 0 0 0 1px rgba(255, 215, 0, 0.35);
 }
 
+.grid-loading {
+  grid-row: span 6;
+}
+
 .grid-loading,
 .load-more-sentinel {
-  column-span: all;
+  grid-column: 1 / -1;
+  align-self: start;
   display: flex;
   justify-content: center;
   align-items: center;

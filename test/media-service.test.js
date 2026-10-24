@@ -233,6 +233,13 @@ test('EXIF 方向 5~8 时 readMetadata 返回显示尺寸而非传感器尺寸',
       assert.equal(metadata.width, 1800, '宽度应为显示尺寸');
       assert.equal(metadata.height, 1200, '高度应为显示尺寸');
     }
+
+    // 缩略图本身也必须转正：1200x1800 + Orientation=6 → 640x427（3:2 横向）。
+    const thumbnail = await service.getThumbnail(file, 640);
+    assert.equal(thumbnail.success, true, thumbnail.error);
+    const thumbMeta = await sharp(fileURLToPath(thumbnail.url)).metadata();
+    assert.equal(thumbMeta.width, 640, '缩略图最长边应为 640');
+    assert.equal(thumbMeta.height, 427, '缩略图应按显示方向输出 3:2 横向');
   } finally {
     await service.dispose();
     await removeTempDirectory(mediaDir);

@@ -61,6 +61,24 @@ test('单个文件 stat 失败不会让整次扫描归零', async () => {
   }
 });
 
+test('目录不可读时返回 error 字段，而不是伪装成空目录', async () => {
+  const userDataDir = await makeTempDirectory('mediew-a0-user-');
+  const service = new MediaService({ userDataPath: userDataDir });
+  await service.initialize();
+  const events = [];
+  try {
+    const missing = path.join(os.tmpdir(), `mediew-does-not-exist-${Date.now()}`);
+    const result = await service.startDirectoryScan(missing, { onError: (e) => events.push(e.message) });
+    assert.equal(result.items.length, 0);
+    assert.equal(typeof result.error, 'string', '返回值必须带 error，渲染层靠它区分空目录和读取失败');
+    assert.equal(result.error.length > 0, true);
+    assert.equal(events.length, 1, 'onError 事件仍要照常发出，统计栏依赖它');
+  } finally {
+    await service.dispose();
+    await removeTempDirectory(userDataDir);
+  }
+});
+
 test('同一文件的大小写不同写法共用一份缩略图缓存', { skip: process.platform !== 'win32' }, async () => {
   const mediaDir = await makeTempDirectory('mediew-case-');
   const userDataDir = await makeTempDirectory('mediew-case-user-');

@@ -243,8 +243,16 @@ class MediaService {
     try {
       mediaEntries = await this.collectMediaEntries(dirPath, recursive, scan);
     } catch (error) {
-      if (typeof options.onError === 'function') options.onError(error);
-      return { scanId, items: [], pendingCount: 0, recursive };
+      // 必须把 error 带回返回值：main.js 的 read-directory 只把 error 字段透传给渲染层，
+      // 光靠 onError 事件只能更新统计栏，界面会退化成"该目录下没有媒体文件"的错误空态。
+      if (typeof options.onError === 'function' && !scan.cancelled) options.onError(error);
+      return {
+        scanId,
+        items: [],
+        pendingCount: 0,
+        recursive,
+        error: error && error.message ? error.message : '目录读取失败'
+      };
     }
 
     // 单个文件在 readdir 与 stat 之间消失（同步盘、相机卡导入、杀软独占）非常常见，
